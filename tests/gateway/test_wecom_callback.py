@@ -6,6 +6,7 @@ from xml.etree import ElementTree as ET
 import pytest
 
 from gateway.config import PlatformConfig
+from gateway.integrations.youpet import YouPetBridgeError
 from gateway.platforms.wecom_callback import WecomCallbackAdapter
 from gateway.platforms.wecom_crypto import WXBizMsgCrypt
 
@@ -310,6 +311,170 @@ class TestWecomCallbackPollLoop:
 
 
 class TestWecomCallbackYouPetBridge:
+    @pytest.mark.asyncio
+    async def test_concurrent_redelivery_waits_for_inflight_dispatch_without_double_send(self):
+        adapter = WecomCallbackAdapter(_config())
+        event = adapter._build_event(
+            _app(),
+            """
+            <xml>
+              <ToUserName>ww1234567890</ToUserName>
+              <FromUserName>zhangsan</FromUserName>
+              <CreateTime>1710000000</CreateTime>
+              <MsgType>text</MsgType>
+              <Content>done</Content>
+              <MsgId>m-concurrent</MsgId>
+            </xml>
+            """,
+        )
+        dispatch_started = asyncio.Event()
+        allow_dispatch = asyncio.Event()
+        calls = []
+
+        class FakeRequest:
+            query = {}
+
+            async def text(self):
+                return "<encrypted/>"
+
+        async def fake_dispatch(inbound_event, app):
+            calls.append((inbound_event.message_id, app["name"]))
+            dispatch_started.set()
+            await allow_dispatch.wait()
+            return True
+
+        adapter._decrypt_request = lambda *args: "<xml/>"
+        adapter._build_event = lambda *args: event
+        adapter._dispatch_youpet_bridge = fake_dispatch
+
+        first = asyncio.create_task(adapter._handle_callback(FakeRequest()))
+        await dispatch_started.wait()
+        second = asyncio.create_task(adapter._handle_callback(FakeRequest()))
+        await asyncio.sleep(0)
+
+        assert calls == [("m-concurrent", "test-app")]
+
+        allow_dispatch.set()
+        first_response, second_response = await asyncio.gather(first, second)
+
+        assert first_response.status == 200
+        assert second_response.status == 200
+        assert adapter._seen_messages["m-concurrent"] > 0
+        assert "m-concurrent" not in adapter._inflight_messages
+        assert calls == [("m-concurrent", "test-app")]
+
+    @pytest.mark.asyncio
+    async def test_cancelled_inflight_dispatch_releases_reservation_for_retry(self):
+        adapter = WecomCallbackAdapter(_config())
+        event = adapter._build_event(
+            _app(),
+            """
+            <xml>
+              <ToUserName>ww1234567890</ToUserName>
+              <FromUserName>zhangsan</FromUserName>
+              <CreateTime>1710000000</CreateTime>
+              <MsgType>text</MsgType>
+              <Content>done</Content>
+              <MsgId>m-cancelled</MsgId>
+            </xml>
+            """,
+        )
+        dispatch_started = asyncio.Event()
+        never_finish_first_dispatch = asyncio.Event()
+        calls = []
+
+        class FakeRequest:
+            query = {}
+
+            async def text(self):
+                return "<encrypted/>"
+
+        async def fake_dispatch(inbound_event, app):
+            calls.append((inbound_event.message_id, app["name"]))
+            if len(calls) == 1:
+                dispatch_started.set()
+                await never_finish_first_dispatch.wait()
+            return True
+
+        adapter._decrypt_request = lambda *args: "<xml/>"
+        adapter._build_event = lambda *args: event
+        adapter._dispatch_youpet_bridge = fake_dispatch
+
+        first = asyncio.create_task(adapter._handle_callback(FakeRequest()))
+        await dispatch_started.wait()
+        assert "m-cancelled" in adapter._inflight_messages
+
+        waiting_duplicate = asyncio.create_task(adapter._handle_callback(FakeRequest()))
+        await asyncio.sleep(0)
+        assert calls == [("m-cancelled", "test-app")]
+
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        duplicate_response = await waiting_duplicate
+
+        assert duplicate_response.status == 502
+        assert "m-cancelled" not in adapter._inflight_messages
+        assert "m-cancelled" not in adapter._seen_messages
+
+        retry_response = await adapter._handle_callback(FakeRequest())
+
+        assert retry_response.status == 200
+        assert adapter._seen_messages["m-cancelled"] > 0
+        assert "m-cancelled" not in adapter._inflight_messages
+        assert calls == [
+            ("m-cancelled", "test-app"),
+            ("m-cancelled", "test-app"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_core_failure_does_not_retain_dedup_record_before_retry(self):
+        adapter = WecomCallbackAdapter(_config())
+        event = adapter._build_event(
+            _app(),
+            """
+            <xml>
+              <ToUserName>ww1234567890</ToUserName>
+              <FromUserName>zhangsan</FromUserName>
+              <CreateTime>1710000000</CreateTime>
+              <MsgType>text</MsgType>
+              <Content>done</Content>
+              <MsgId>m-retry</MsgId>
+            </xml>
+            """,
+        )
+        calls = []
+
+        class FakeRequest:
+            query = {}
+
+            async def text(self):
+                return "<encrypted/>"
+
+        async def fake_dispatch(inbound_event, app):
+            calls.append((inbound_event.message_id, app["name"]))
+            if len(calls) == 1:
+                raise YouPetBridgeError("temporary core failure")
+            return True
+
+        adapter._decrypt_request = lambda *args: "<xml/>"
+        adapter._build_event = lambda *args: event
+        adapter._dispatch_youpet_bridge = fake_dispatch
+
+        first = await adapter._handle_callback(FakeRequest())
+        assert first.status == 502
+        assert "m-retry" not in adapter._seen_messages
+
+        second = await adapter._handle_callback(FakeRequest())
+        assert second.status == 200
+        assert adapter._seen_messages["m-retry"] > 0
+        assert calls == [("m-retry", "test-app"), ("m-retry", "test-app")]
+        assert adapter._message_queue.empty()
+
+        duplicate = await adapter._handle_callback(FakeRequest())
+        assert duplicate.status == 200
+        assert calls == [("m-retry", "test-app"), ("m-retry", "test-app")]
+
     @pytest.mark.asyncio
     async def test_youpet_bridge_can_skip_agent_dispatch(self):
         adapter = WecomCallbackAdapter(_config())

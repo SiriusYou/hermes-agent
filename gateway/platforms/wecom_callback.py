@@ -78,6 +78,7 @@ class WecomCallbackAdapter(BasePlatformAdapter):
         self._message_queue: asyncio.Queue[MessageEvent] = asyncio.Queue()
         self._poll_task: Optional[asyncio.Task] = None
         self._seen_messages: Dict[str, float] = {}
+        self._inflight_messages: Dict[str, asyncio.Future[bool]] = {}
         self._user_app_map: Dict[str, str] = {}
         self._access_tokens: Dict[str, Dict[str, Any]] = {}
         self._youpet_bridge = build_youpet_bridge_from_env(self.send)
@@ -282,6 +283,15 @@ class WecomCallbackAdapter(BasePlatformAdapter):
         body = await request.text()
 
         for app in self._apps:
+            reserved_message_id: str | None = None
+            reserved_result: asyncio.Future[bool] | None = None
+
+            def finish_reserved_message(success: bool) -> None:
+                if reserved_message_id:
+                    self._inflight_messages.pop(reserved_message_id, None)
+                if reserved_result is not None and not reserved_result.done():
+                    reserved_result.set_result(success)
+
             try:
                 decrypted = self._decrypt_request(
                     app, body, msg_signature, timestamp, nonce,
@@ -290,6 +300,7 @@ class WecomCallbackAdapter(BasePlatformAdapter):
                 if event is not None:
                     # Deduplicate: WeCom retries callbacks on timeout,
                     # producing duplicate inbound messages (#10305).
+                    message_seen_at: float | None = None
                     if event.message_id:
                         now = time.time()
                         if event.message_id in self._seen_messages:
@@ -297,7 +308,15 @@ class WecomCallbackAdapter(BasePlatformAdapter):
                                 logger.debug("[WecomCallback] Duplicate MsgId %s, skipping", event.message_id)
                                 return web.Response(text="success", content_type="text/plain")
                             del self._seen_messages[event.message_id]
-                        self._seen_messages[event.message_id] = now
+                        inflight_result = self._inflight_messages.get(event.message_id)
+                        if inflight_result is not None:
+                            if await inflight_result:
+                                return web.Response(text="success", content_type="text/plain")
+                            return web.Response(status=502, text="youpet bridge failed")
+                        reserved_message_id = event.message_id
+                        reserved_result = asyncio.get_running_loop().create_future()
+                        self._inflight_messages[event.message_id] = reserved_result
+                        message_seen_at = now
                         # Prune expired entries when cache grows large
                         if len(self._seen_messages) > 2000:
                             cutoff = now - MESSAGE_DEDUP_TTL_SECONDS
@@ -311,15 +330,23 @@ class WecomCallbackAdapter(BasePlatformAdapter):
                     skip_agent_dispatch = await self._dispatch_youpet_bridge(event, app)
                     if not skip_agent_dispatch:
                         await self._message_queue.put(event)
+                    if event.message_id and message_seen_at is not None:
+                        self._seen_messages[event.message_id] = message_seen_at
+                    finish_reserved_message(success=True)
                 # Immediately acknowledge — the agent's reply will arrive
                 # later via the proactive message/send API.
                 return web.Response(text="success", content_type="text/plain")
             except WeComCryptoError:
                 continue
+            except asyncio.CancelledError:
+                finish_reserved_message(success=False)
+                raise
             except YouPetBridgeError:
+                finish_reserved_message(success=False)
                 logger.exception("[WecomCallback] YouPet bridge failed")
                 return web.Response(status=502, text="youpet bridge failed")
             except Exception:
+                finish_reserved_message(success=False)
                 logger.exception("[WecomCallback] Error handling message")
                 break
         return web.Response(status=400, text="invalid callback payload")
