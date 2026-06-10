@@ -74,17 +74,47 @@ def _event():
 
 
 def _outbox_item(event_id, event_type, payload):
+    aggregate_type, aggregate_id = _aggregate_for_outbox_item(event_type, payload)
     return {
         "event_id": event_id,
         "consumer": "hermes",
+        "state": "pending",
+        "attempts": 0,
+        "next_attempt_at": "2026-06-01T00:00:00Z",
+        "last_attempt_at": None,
+        "delivered_at": None,
+        "dead_lettered_at": None,
+        "last_error": None,
         "event_type": event_type,
+        "aggregate_type": aggregate_type,
+        "aggregate_id": aggregate_id,
+        "correlation_id": "corr-1",
         "payload": {
-            "event_id": f"evt-{event_id}",
+            "aggregate": {
+                "id": aggregate_id,
+                "type": aggregate_type,
+            },
+            "correlation_id": "corr-1",
+            "event_id": f"payload-{event_id}",
             "event_type": event_type,
             "event_version": 1,
+            "idempotency_key": f"idem-{event_type}",
+            "occurred_at": "2026-06-01T00:00:00Z",
             "payload": payload,
+            "producer": "youpet-core",
         },
+        "created_at": "2026-06-01T00:00:00Z",
     }
+
+
+def _aggregate_for_outbox_item(event_type, payload):
+    if event_type.startswith("health_plan."):
+        return "health_plan", payload.get("plan_id", "plan-1")
+    if event_type.startswith("task."):
+        return "task_instance", payload.get("task_id", "task-1")
+    if event_type.startswith("alert."):
+        return "alert", payload.get("alert_id", payload.get("related_id", "alert-1"))
+    return "task_instance", payload.get("task_id", "task-1")
 
 
 def _counts(**overrides):
