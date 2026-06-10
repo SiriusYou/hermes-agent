@@ -177,6 +177,120 @@ async def test_poll_once_sends_reminder_and_acks():
 
 
 @pytest.mark.asyncio
+async def test_poll_once_sends_task_escalated_once_and_acks_alert_created_noop():
+    sent = []
+
+    async def fake_send(chat_id, content):
+        sent.append((chat_id, content))
+        return SendResult(success=True)
+
+    task_escalated_event_id = "55555555-5555-4555-8555-555555555555"
+    alert_created_event_id = "66666666-6666-4666-8666-666666666666"
+    client = FakeCoreClient(
+        outbox_items=[
+            _outbox_item(
+                task_escalated_event_id,
+                "task.escalated",
+                {
+                    "task_id": "task-5",
+                    "alert_id": "alert-5",
+                    "alert_type": "missed_checkin",
+                    "severity": "high",
+                    "recipient_user_id": "user-123",
+                    "summary": "Needs follow-up",
+                },
+            ),
+            _outbox_item(
+                alert_created_event_id,
+                "alert.created",
+                {
+                    "alert_id": "alert-5",
+                    "alert_type": "missed_checkin",
+                    "severity": "high",
+                    "related_type": "task_instance",
+                    "related_id": "task-5",
+                    "assigned_to": None,
+                    "summary": "Needs follow-up",
+                },
+            ),
+        ],
+    )
+    bridge = YouPetBridge(
+        _settings(
+            default_chat_id="ww1234567890:default",
+            user_chat_map={"user-123": "ww1234567890:zhangsan"},
+        ),
+        fake_send,
+    )
+    bridge._client = client
+
+    count = await bridge.poll_once()
+
+    assert count == 2
+    assert sent == [("ww1234567890:zhangsan", "[YouPet Alert] high: Needs follow-up")]
+    ack_urls = [
+        call["url"]
+        for call in client.post_calls
+        if call["url"].endswith("/ack")
+    ]
+    assert any(
+        url.endswith(f"/internal/events/outbox/{task_escalated_event_id}/ack")
+        for url in ack_urls
+    )
+    assert any(
+        url.endswith(f"/internal/events/outbox/{alert_created_event_id}/ack")
+        for url in ack_urls
+    )
+    assert not any(call["url"].endswith("/nack") for call in client.post_calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"alert_id": "alert-6", "severity": "high", "summary": "Missing recipient"},
+        {
+            "alert_id": "alert-6",
+            "severity": "high",
+            "recipient_user_id": "missing-user",
+            "summary": "Unmapped recipient",
+        },
+    ],
+)
+async def test_poll_once_nacks_unroutable_task_escalated_without_default_fallback(payload):
+    sent = []
+
+    async def fake_send(chat_id, content):
+        sent.append((chat_id, content))
+        return SendResult(success=True)
+
+    event_id = "77777777-7777-4777-8777-777777777777"
+    client = FakeCoreClient(
+        outbox_items=[
+            _outbox_item(
+                event_id,
+                "task.escalated",
+                payload,
+            ),
+        ],
+    )
+    bridge = YouPetBridge(
+        _settings(default_chat_id="ww1234567890:default"),
+        fake_send,
+    )
+    bridge._client = client
+
+    count = await bridge.poll_once()
+
+    assert count == 1
+    assert sent == []
+    assert client.post_calls[-1]["url"].endswith(f"/internal/events/outbox/{event_id}/nack")
+    assert client.post_calls[-1]["json"]["error"] == (
+        "No WeCom chat_id for YouPet outbox recipient"
+    )
+
+
+@pytest.mark.asyncio
 async def test_poll_once_dedupes_processed_event_id():
     sent = []
 

@@ -234,6 +234,18 @@ class YouPetBridge:
             await self._send_required(chat_id, self._render_task_message(event_type, payload))
             return
 
+        if event_type == "task.escalated":
+            chat_id = self._resolve_chat_id(
+                payload,
+                ("recipient_user_id",),
+                allow_default=False,
+            )
+            await self._send_required(chat_id, self._render_alert_message(event_type, payload))
+            return
+
+        if event_type == "alert.created":
+            return
+
         chat_id = self._resolve_chat_id(
             payload,
             ("recipient_user_id", "owner_user_id", "assigned_to"),
@@ -273,7 +285,13 @@ class YouPetBridge:
     def _processed_event_state_path() -> Path:
         return get_hermes_home() / "integrations" / "youpet_processed_outbox_events.json"
 
-    def _resolve_chat_id(self, payload: dict[str, Any], user_keys: tuple[str, ...]) -> str:
+    def _resolve_chat_id(
+        self,
+        payload: dict[str, Any],
+        user_keys: tuple[str, ...],
+        *,
+        allow_default: bool = True,
+    ) -> str:
         for key in user_keys:
             user_id = payload.get(key)
             if not user_id:
@@ -284,7 +302,7 @@ class YouPetBridge:
             )
             if chat_id:
                 return chat_id
-        if self.settings.default_chat_id:
+        if allow_default and self.settings.default_chat_id:
             return self.settings.default_chat_id
         raise YouPetBridgeError("No WeCom chat_id for YouPet outbox recipient")
 
