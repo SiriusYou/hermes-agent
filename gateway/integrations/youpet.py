@@ -9,7 +9,7 @@ import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional, TypedDict
 
 import httpx
 
@@ -38,6 +38,15 @@ class YouPetBridgeError(RuntimeError):
 SendCallable = Callable[[str, str], Awaitable[SendResult]]
 
 
+class YouPetPollCounts(TypedDict):
+    pulled: int
+    processed: int
+    sent: int
+    acked: int
+    nacked: int
+    skipped: int
+
+
 @dataclass
 class YouPetBridgeSettings:
     enabled: bool = False
@@ -64,6 +73,17 @@ def build_youpet_bridge_from_env(send: SendCallable) -> Optional["YouPetBridge"]
     if not settings.enabled:
         return None
     return YouPetBridge(settings, send)
+
+
+def _poll_counts() -> YouPetPollCounts:
+    return {
+        "pulled": 0,
+        "processed": 0,
+        "sent": 0,
+        "acked": 0,
+        "nacked": 0,
+        "skipped": 0,
+    }
 
 
 def youpet_settings_from_env() -> YouPetBridgeSettings:
@@ -154,9 +174,10 @@ class YouPetBridge:
             self._runtime_user_chat_map[str(matched_user_id)] = str(event.source.chat_id)
         return self.settings.skip_agent_dispatch
 
-    async def poll_once(self) -> int:
+    async def poll_once(self) -> YouPetPollCounts:
+        counts = _poll_counts()
         if not self.settings.configured:
-            return 0
+            return counts
         response = await self._get(
             "/internal/events/outbox",
             params={
@@ -169,15 +190,33 @@ class YouPetBridge:
         if not isinstance(items, list):
             raise YouPetBridgeError("Core outbox response did not contain items")
 
+        counts["pulled"] = len(items)
         for item in items:
-            event_id = str(item.get("event_id") or "")
+            counts["processed"] += 1
+            if not isinstance(item, dict):
+                counts["skipped"] += 1
+                logger.error(
+                    "[YouPetBridge] Skipping outbox item with missing event_id",
+                )
+                continue
+            event_id = str(item.get("event_id") or "").strip()
+            if not event_id:
+                counts["skipped"] += 1
+                logger.error(
+                    "[YouPetBridge] Skipping outbox item with missing event_id",
+                )
+                continue
             try:
                 if event_id in self._processed_event_ids:
                     await self._ack(event_id)
+                    counts["acked"] += 1
                     continue
-                await self._process_outbox_item(item)
+                sent = await self._process_outbox_item(item)
+                if sent:
+                    counts["sent"] += 1
                 self._remember_processed_event_id(event_id)
                 await self._ack(event_id)
+                counts["acked"] += 1
             except Exception as exc:
                 logger.warning(
                     "[YouPetBridge] Failed to process outbox event %s: %s",
@@ -185,7 +224,8 @@ class YouPetBridge:
                     exc,
                 )
                 await self._nack(event_id, str(exc))
-        return len(items)
+                counts["nacked"] += 1
+        return counts
 
     async def _poll_loop(self) -> None:
         while True:
@@ -214,25 +254,25 @@ class YouPetBridge:
             "received_at": _iso_utc(event.timestamp),
         }
 
-    async def _process_outbox_item(self, item: dict[str, Any]) -> None:
+    async def _process_outbox_item(self, item: dict[str, Any]) -> bool:
         event_type = str(item.get("event_type") or "")
         envelope = item.get("payload") if isinstance(item.get("payload"), dict) else {}
         if not event_type:
             event_type = str(envelope.get("event_type") or "")
-        payload = envelope.get("payload") if isinstance(envelope.get("payload"), dict) else {}
 
         if event_type not in SUPPORTED_OUTBOX_EVENTS:
-            if self.settings.ack_unhandled_events:
-                return
-            raise YouPetBridgeError(f"Unhandled YouPet event type: {event_type}")
+            logger.info("[YouPetBridge] Acknowledging unhandled outbox event type: %s", event_type)
+            return False
 
         if event_type == "health_plan.activated":
-            return
+            return False
+
+        payload = self._business_payload(envelope, event_type)
 
         if event_type in {"task.created", "task.reminder_due"}:
             chat_id = self._resolve_chat_id(payload, ("recipient_user_id", "owner_user_id"))
             await self._send_required(chat_id, self._render_task_message(event_type, payload))
-            return
+            return True
 
         if event_type == "task.escalated":
             chat_id = self._resolve_chat_id(
@@ -241,16 +281,25 @@ class YouPetBridge:
                 allow_default=False,
             )
             await self._send_required(chat_id, self._render_alert_message(event_type, payload))
-            return
+            return True
 
         if event_type == "alert.created":
-            return
+            logger.info("[YouPetBridge] Acknowledging alert.created without WeCom send")
+            return False
 
         chat_id = self._resolve_chat_id(
             payload,
             ("recipient_user_id", "owner_user_id", "assigned_to"),
         )
         await self._send_required(chat_id, self._render_alert_message(event_type, payload))
+        return True
+
+    @staticmethod
+    def _business_payload(envelope: dict[str, Any], event_type: str) -> dict[str, Any]:
+        payload = envelope.get("payload")
+        if isinstance(payload, dict):
+            return payload
+        raise YouPetBridgeError(f"Malformed YouPet {event_type} payload")
 
     def _load_processed_event_ids(self) -> list[str]:
         path = self._processed_event_state_path()

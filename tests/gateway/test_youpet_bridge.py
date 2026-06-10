@@ -87,6 +87,19 @@ def _outbox_item(event_id, event_type, payload):
     }
 
 
+def _counts(**overrides):
+    counts = {
+        "pulled": 0,
+        "processed": 0,
+        "sent": 0,
+        "acked": 0,
+        "nacked": 0,
+        "skipped": 0,
+    }
+    counts.update(overrides)
+    return counts
+
+
 @pytest.mark.asyncio
 async def test_wecom_event_posts_core_inbound_and_learns_chat_mapping():
     sent = []
@@ -163,9 +176,9 @@ async def test_poll_once_sends_reminder_and_acks():
     )
     bridge._client = client
 
-    count = await bridge.poll_once()
+    counts = await bridge.poll_once()
 
-    assert count == 1
+    assert counts == _counts(pulled=1, processed=1, sent=1, acked=1)
     assert sent == [
         (
             "ww1234567890:zhangsan",
@@ -177,7 +190,8 @@ async def test_poll_once_sends_reminder_and_acks():
 
 
 @pytest.mark.asyncio
-async def test_poll_once_sends_task_escalated_once_and_acks_alert_created_noop():
+async def test_poll_once_sends_task_escalated_once_and_acks_alert_created_noop(caplog):
+    caplog.set_level("INFO")
     sent = []
 
     async def fake_send(chat_id, content):
@@ -224,10 +238,11 @@ async def test_poll_once_sends_task_escalated_once_and_acks_alert_created_noop()
     )
     bridge._client = client
 
-    count = await bridge.poll_once()
+    counts = await bridge.poll_once()
 
-    assert count == 2
+    assert counts == _counts(pulled=2, processed=2, sent=1, acked=2)
     assert sent == [("ww1234567890:zhangsan", "[YouPet Alert] high: Needs follow-up")]
+    assert "Acknowledging alert.created without WeCom send" in caplog.text
     ack_urls = [
         call["url"]
         for call in client.post_calls
@@ -280,14 +295,118 @@ async def test_poll_once_nacks_unroutable_task_escalated_without_default_fallbac
     )
     bridge._client = client
 
-    count = await bridge.poll_once()
+    counts = await bridge.poll_once()
 
-    assert count == 1
+    assert counts == _counts(pulled=1, processed=1, nacked=1)
     assert sent == []
     assert client.post_calls[-1]["url"].endswith(f"/internal/events/outbox/{event_id}/nack")
     assert client.post_calls[-1]["json"]["error"] == (
         "No WeCom chat_id for YouPet outbox recipient"
     )
+
+
+@pytest.mark.asyncio
+async def test_poll_once_skips_empty_event_id_before_dispatch_even_on_repoll(caplog):
+    sent = []
+
+    async def fake_send(chat_id, content):
+        sent.append((chat_id, content))
+        return SendResult(success=True)
+
+    client = FakeCoreClient(
+        outbox_items=[
+            _outbox_item(
+                "",
+                "task.reminder_due",
+                {
+                    "task_id": "task-empty",
+                    "recipient_user_id": "user-123",
+                    "message_context": {"pet_name": "Mochi", "plan_title": "care task"},
+                },
+            ),
+            _outbox_item(
+                "   ",
+                "task.reminder_due",
+                {
+                    "task_id": "task-whitespace",
+                    "recipient_user_id": "user-123",
+                    "message_context": {"pet_name": "Mochi", "plan_title": "care task"},
+                },
+            ),
+            None,
+        ],
+    )
+    bridge = YouPetBridge(
+        _settings(user_chat_map={"user-123": "ww1234567890:zhangsan"}),
+        fake_send,
+    )
+    bridge._client = client
+
+    first_counts = await bridge.poll_once()
+    second_counts = await bridge.poll_once()
+
+    assert first_counts == _counts(pulled=3, processed=3, skipped=3)
+    assert second_counts == _counts(pulled=3, processed=3, skipped=3)
+    assert sent == []
+    assert client.post_calls == []
+    assert caplog.text.count("Skipping outbox item with missing event_id") == 6
+
+
+@pytest.mark.asyncio
+async def test_poll_once_observably_acks_unknown_event_type(caplog):
+    caplog.set_level("INFO")
+    sent = []
+
+    async def fake_send(chat_id, content):
+        sent.append((chat_id, content))
+        return SendResult(success=True)
+
+    event_id = "88888888-8888-4888-8888-888888888888"
+    client = FakeCoreClient(
+        outbox_items=[
+            _outbox_item(
+                event_id,
+                "future.event_type",
+                {"task_id": "task-future"},
+            ),
+        ],
+    )
+    bridge = YouPetBridge(_settings(), fake_send)
+    bridge._client = client
+
+    counts = await bridge.poll_once()
+
+    assert counts == _counts(pulled=1, processed=1, acked=1)
+    assert sent == []
+    assert client.post_calls[-1]["url"].endswith(f"/internal/events/outbox/{event_id}/ack")
+    assert "Acknowledging unhandled outbox event type: future.event_type" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_poll_once_nacks_malformed_known_event(caplog):
+    sent = []
+
+    async def fake_send(chat_id, content):
+        sent.append((chat_id, content))
+        return SendResult(success=True)
+
+    event_id = "99999999-9999-4999-8999-999999999999"
+    item = _outbox_item(event_id, "task.reminder_due", {"task_id": "task-malformed"})
+    item["payload"]["payload"] = None
+    client = FakeCoreClient(outbox_items=[item])
+    bridge = YouPetBridge(
+        _settings(user_chat_map={"user-123": "ww1234567890:zhangsan"}),
+        fake_send,
+    )
+    bridge._client = client
+
+    counts = await bridge.poll_once()
+
+    assert counts == _counts(pulled=1, processed=1, nacked=1)
+    assert sent == []
+    assert client.post_calls[-1]["url"].endswith(f"/internal/events/outbox/{event_id}/nack")
+    assert client.post_calls[-1]["json"]["error"] == "Malformed YouPet task.reminder_due payload"
+    assert "Malformed YouPet task.reminder_due payload" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -347,9 +466,9 @@ async def test_poll_once_nacks_unroutable_reminder():
     bridge = YouPetBridge(_settings(), fake_send)
     bridge._client = client
 
-    count = await bridge.poll_once()
+    counts = await bridge.poll_once()
 
-    assert count == 1
+    assert counts == _counts(pulled=1, processed=1, nacked=1)
     assert sent == []
     assert client.post_calls[-1]["url"].endswith(f"/internal/events/outbox/{event_id}/nack")
     assert client.post_calls[-1]["json"]["error"] == "No WeCom chat_id for YouPet outbox recipient"
@@ -376,8 +495,8 @@ async def test_poll_once_acks_health_plan_without_send():
     bridge = YouPetBridge(_settings(), fake_send)
     bridge._client = client
 
-    count = await bridge.poll_once()
+    counts = await bridge.poll_once()
 
-    assert count == 1
+    assert counts == _counts(pulled=1, processed=1, acked=1)
     assert sent == []
     assert client.post_calls[-1]["url"].endswith(f"/internal/events/outbox/{event_id}/ack")
