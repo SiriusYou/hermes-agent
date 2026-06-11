@@ -13,6 +13,7 @@ Supports multiple self-built apps under one gateway instance, scoped by
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import socket as _socket
 import time
@@ -49,6 +50,8 @@ from gateway.config import Platform, PlatformConfig
 from gateway.integrations.youpet import YouPetBridgeError, build_youpet_bridge_from_env
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from gateway.platforms.wecom_crypto import WXBizMsgCrypt, WeComCryptoError
+from hermes_constants import get_hermes_home
+from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +60,7 @@ DEFAULT_PORT = 8645
 DEFAULT_PATH = "/wecom/callback"
 ACCESS_TOKEN_TTL_SECONDS = 7200
 MESSAGE_DEDUP_TTL_SECONDS = 300
+MAX_PERSISTED_DEDUP_ENTRIES = 2000
 
 
 def check_wecom_callback_requirements() -> bool:
@@ -70,6 +74,11 @@ class WecomCallbackAdapter(BasePlatformAdapter):
         self._host = str(extra.get("host") or DEFAULT_HOST)
         self._port = int(extra.get("port") or DEFAULT_PORT)
         self._path = str(extra.get("path") or DEFAULT_PATH)
+        self._replay_window_seconds = self._read_replay_window_seconds(extra)
+        # Timestamp freshness accepts +/- replay_window for clock skew. Retain
+        # successful MsgIds across that whole span so future-dated callbacks
+        # cannot be replayed after a one-window seen record expires.
+        self._dedup_retention_seconds = self._replay_window_seconds * 2
         self._apps: List[Dict[str, Any]] = self._normalize_apps(extra)
         self._runner: Optional[web.AppRunner] = None
         self._site: Optional[web.TCPSite] = None
@@ -77,7 +86,8 @@ class WecomCallbackAdapter(BasePlatformAdapter):
         self._http_client: Optional[httpx.AsyncClient] = None
         self._message_queue: asyncio.Queue[MessageEvent] = asyncio.Queue()
         self._poll_task: Optional[asyncio.Task] = None
-        self._seen_messages: Dict[str, float] = {}
+        self._dedup_state_path = get_hermes_home() / "wecom_callback" / "replay_dedup.json"
+        self._seen_messages: Dict[str, float] = self._load_seen_messages()
         self._inflight_messages: Dict[str, asyncio.Future[bool]] = {}
         self._user_app_map: Dict[str, str] = {}
         self._access_tokens: Dict[str, Dict[str, Any]] = {}
@@ -90,6 +100,21 @@ class WecomCallbackAdapter(BasePlatformAdapter):
     @staticmethod
     def _user_app_key(corp_id: str, user_id: str) -> str:
         return f"{corp_id}:{user_id}" if corp_id else user_id
+
+    @staticmethod
+    def _read_replay_window_seconds(extra: Dict[str, Any]) -> int:
+        raw = extra.get("replay_window_seconds", MESSAGE_DEDUP_TTL_SECONDS)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return MESSAGE_DEDUP_TTL_SECONDS
+        return value if value > 0 else MESSAGE_DEDUP_TTL_SECONDS
+
+    @staticmethod
+    def _message_dedup_key(app: Dict[str, Any], message_id: str) -> str:
+        corp_id = str(app.get("corp_id") or "")
+        app_id = str(app.get("agent_id") or app.get("name") or "")
+        return f"{corp_id}:{app_id}:{message_id}"
 
     @staticmethod
     def _normalize_apps(extra: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -280,15 +305,17 @@ class WecomCallbackAdapter(BasePlatformAdapter):
         msg_signature = request.query.get("msg_signature", "")
         timestamp = request.query.get("timestamp", "")
         nonce = request.query.get("nonce", "")
+        if not self._timestamp_is_fresh(timestamp):
+            return web.Response(status=403, text="stale callback timestamp")
         body = await request.text()
 
         for app in self._apps:
-            reserved_message_id: str | None = None
+            reserved_message_key: str | None = None
             reserved_result: asyncio.Future[bool] | None = None
 
             def finish_reserved_message(success: bool) -> None:
-                if reserved_message_id:
-                    self._inflight_messages.pop(reserved_message_id, None)
+                if reserved_message_key:
+                    self._inflight_messages.pop(reserved_message_key, None)
                 if reserved_result is not None and not reserved_result.done():
                     reserved_result.set_result(success)
 
@@ -303,24 +330,25 @@ class WecomCallbackAdapter(BasePlatformAdapter):
                     message_seen_at: float | None = None
                     if event.message_id:
                         now = time.time()
-                        if event.message_id in self._seen_messages:
-                            if now - self._seen_messages[event.message_id] < MESSAGE_DEDUP_TTL_SECONDS:
+                        dedup_key = self._message_dedup_key(app, event.message_id)
+                        if dedup_key in self._seen_messages:
+                            if now - self._seen_messages[dedup_key] <= self._dedup_retention_seconds:
                                 logger.debug("[WecomCallback] Duplicate MsgId %s, skipping", event.message_id)
                                 return web.Response(text="success", content_type="text/plain")
-                            del self._seen_messages[event.message_id]
-                        inflight_result = self._inflight_messages.get(event.message_id)
+                            del self._seen_messages[dedup_key]
+                            self._persist_seen_messages()
+                        inflight_result = self._inflight_messages.get(dedup_key)
                         if inflight_result is not None:
                             if await inflight_result:
                                 return web.Response(text="success", content_type="text/plain")
                             return web.Response(status=502, text="youpet bridge failed")
-                        reserved_message_id = event.message_id
+                        reserved_message_key = dedup_key
                         reserved_result = asyncio.get_running_loop().create_future()
-                        self._inflight_messages[event.message_id] = reserved_result
+                        self._inflight_messages[dedup_key] = reserved_result
                         message_seen_at = now
                         # Prune expired entries when cache grows large
-                        if len(self._seen_messages) > 2000:
-                            cutoff = now - MESSAGE_DEDUP_TTL_SECONDS
-                            self._seen_messages = {k: v for k, v in self._seen_messages.items() if v > cutoff}
+                        if len(self._seen_messages) > MAX_PERSISTED_DEDUP_ENTRIES:
+                            self._seen_messages = self._trim_seen_messages(self._seen_messages)
                     # Record which app this user belongs to.
                     if event.source and event.source.user_id:
                         map_key = self._user_app_key(
@@ -330,8 +358,9 @@ class WecomCallbackAdapter(BasePlatformAdapter):
                     skip_agent_dispatch = await self._dispatch_youpet_bridge(event, app)
                     if not skip_agent_dispatch:
                         await self._message_queue.put(event)
-                    if event.message_id and message_seen_at is not None:
-                        self._seen_messages[event.message_id] = message_seen_at
+                    if reserved_message_key and message_seen_at is not None:
+                        self._seen_messages[reserved_message_key] = message_seen_at
+                        self._persist_seen_messages()
                     finish_reserved_message(success=True)
                 # Immediately acknowledge — the agent's reply will arrive
                 # later via the proactive message/send API.
@@ -422,6 +451,77 @@ class WecomCallbackAdapter(BasePlatformAdapter):
             encoding_aes_key=str(app.get("encoding_aes_key") or ""),
             receive_id=str(app.get("corp_id") or ""),
         )
+
+    def _timestamp_is_fresh(self, timestamp: str) -> bool:
+        try:
+            signed_at = int(str(timestamp).strip())
+        except (TypeError, ValueError):
+            return False
+        return abs(time.time() - signed_at) <= self._replay_window_seconds
+
+    def _load_seen_messages(self) -> Dict[str, float]:
+        try:
+            payload = json.loads(self._dedup_state_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except (OSError, json.JSONDecodeError):
+            logger.warning(
+                "[WecomCallback] Failed to load replay dedup state from %s",
+                self._dedup_state_path,
+                exc_info=True,
+            )
+            return {}
+
+        raw_entries = payload.get("seen_messages") if isinstance(payload, dict) else None
+        if not isinstance(raw_entries, dict):
+            return {}
+
+        now = time.time()
+        valid: Dict[str, float] = {}
+        for key, seen_at in raw_entries.items():
+            try:
+                seen_at_float = float(seen_at)
+            except (TypeError, ValueError):
+                continue
+            age = now - seen_at_float
+            if 0 <= age <= self._dedup_retention_seconds:
+                valid[str(key)] = seen_at_float
+        return self._trim_seen_messages(valid)
+
+    def _trim_seen_messages(self, entries: Dict[str, float]) -> Dict[str, float]:
+        now = time.time()
+        cutoff = now - self._dedup_retention_seconds
+        valid = {
+            key: seen_at
+            for key, seen_at in entries.items()
+            if cutoff <= seen_at <= now
+        }
+        if len(valid) <= MAX_PERSISTED_DEDUP_ENTRIES:
+            return valid
+        logger.warning(
+            "[WecomCallback] Replay dedup state retained %d in-window entries, "
+            "exceeding cap %d at %s",
+            len(valid),
+            MAX_PERSISTED_DEDUP_ENTRIES,
+            self._dedup_state_path,
+        )
+        return valid
+
+    def _persist_seen_messages(self) -> None:
+        self._seen_messages = self._trim_seen_messages(self._seen_messages)
+        try:
+            atomic_json_write(
+                self._dedup_state_path,
+                {"seen_messages": self._seen_messages},
+                indent=None,
+                separators=(",", ":"),
+            )
+        except OSError:
+            logger.warning(
+                "[WecomCallback] Failed to persist replay dedup state to %s",
+                self._dedup_state_path,
+                exc_info=True,
+            )
 
     def _get_app_by_name(self, name: Optional[str]) -> Optional[Dict[str, Any]]:
         if not name:
