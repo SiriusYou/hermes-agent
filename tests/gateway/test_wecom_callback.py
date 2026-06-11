@@ -1,6 +1,7 @@
 """Tests for the WeCom callback-mode adapter."""
 
 import asyncio
+import hmac
 from xml.etree import ElementTree as ET
 
 import pytest
@@ -53,6 +54,51 @@ class TestWecomCrypto:
         from gateway.platforms.wecom_crypto import SignatureError
         with pytest.raises(SignatureError):
             crypt.decrypt("bad-sig", "1", "n", root.findtext("Encrypt", default=""))
+
+    def test_non_ascii_signature_mismatch_raises_signature_error(self):
+        app = _app()
+        crypt = WXBizMsgCrypt(app["token"], app["encoding_aes_key"], app["corp_id"])
+        encrypted_xml = crypt.encrypt("<xml/>", nonce="n", timestamp="1")
+        root = ET.fromstring(encrypted_xml)
+        from gateway.platforms.wecom_crypto import SignatureError
+
+        with pytest.raises(SignatureError):
+            crypt.decrypt("sécret", "1", "n", root.findtext("Encrypt", default=""))
+
+    def test_signature_compare_is_timing_safe(self, monkeypatch):
+        """Ensure hmac.compare_digest is used for WeCom signature comparison."""
+        calls: list[tuple[bytes, bytes]] = []
+        real_compare = hmac.compare_digest
+
+        def _spy(a, b):
+            calls.append((a, b))
+            return real_compare(a, b)
+
+        monkeypatch.setattr("gateway.platforms.wecom_crypto.hmac.compare_digest", _spy)
+
+        app = _app()
+        crypt = WXBizMsgCrypt(app["token"], app["encoding_aes_key"], app["corp_id"])
+        encrypted_xml = crypt.encrypt(
+            "<xml><Content>hello</Content></xml>",
+            nonce="n",
+            timestamp="1",
+        )
+        root = ET.fromstring(encrypted_xml)
+        signature = root.findtext("MsgSignature", default="")
+        decrypted = crypt.decrypt(
+            signature,
+            "1",
+            "n",
+            root.findtext("Encrypt", default=""),
+        )
+
+        assert b"<Content>hello</Content>" in decrypted
+        assert calls, (
+            "hmac.compare_digest was never called; WeCom signature check is not timing-safe"
+        )
+        provided, expected = calls[0]
+        assert provided == signature.encode("utf-8")
+        assert expected == signature.encode("utf-8")
 
 
 class TestWecomCallbackEventConstruction:
