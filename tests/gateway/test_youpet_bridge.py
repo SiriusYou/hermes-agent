@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from unittest.mock import AsyncMock
 
 import pytest
 
 from gateway.config import Platform
-from gateway.integrations.youpet import YouPetBridge, YouPetBridgeSettings
+from gateway.integrations.youpet import (
+    YouPetBridge,
+    YouPetBridgeSettings,
+    is_wecom_pre_core_authorized,
+)
 from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.session import SessionSource
 
@@ -73,6 +78,23 @@ def _event():
     )
 
 
+def _wecom_event(platform: Platform, *, user_id: str = "zhangsan", chat_id: str = "chat-1"):
+    source = SessionSource(
+        platform=platform,
+        chat_id=chat_id,
+        chat_type="group" if chat_id.startswith("group") else "dm",
+        user_id=user_id,
+        user_name=user_id,
+    )
+    return MessageEvent(
+        text="completed",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="msg-auth",
+        timestamp=datetime(2026, 6, 2, 12, 0, tzinfo=UTC),
+    )
+
+
 def _outbox_item(event_id, event_type, payload):
     aggregate_type, aggregate_id = _aggregate_for_outbox_item(event_type, payload)
     return {
@@ -130,8 +152,58 @@ def _counts(**overrides):
     return counts
 
 
+@pytest.mark.parametrize(
+    ("platform", "env_name"),
+    [
+        (Platform.WECOM_CALLBACK, "WECOM_CALLBACK_ALLOWED_USERS"),
+        (Platform.WECOM, "WECOM_ALLOWED_USERS"),
+        (Platform.WECOM, "GATEWAY_ALLOWED_USERS"),
+    ],
+)
+def test_pre_core_authorization_accepts_env_allowlists(monkeypatch, platform, env_name):
+    monkeypatch.setenv(env_name, "zhangsan")
+
+    assert is_wecom_pre_core_authorized(_wecom_event(platform)) is True
+
+
+@pytest.mark.parametrize(
+    ("platform", "env_name"),
+    [
+        (Platform.WECOM_CALLBACK, "WECOM_CALLBACK_ALLOW_ALL_USERS"),
+        (Platform.WECOM, "WECOM_ALLOW_ALL_USERS"),
+        (Platform.WECOM, "GATEWAY_ALLOW_ALL_USERS"),
+    ],
+)
+def test_pre_core_authorization_accepts_allow_all_flags(monkeypatch, platform, env_name):
+    monkeypatch.setenv(env_name, "true")
+
+    assert is_wecom_pre_core_authorized(_wecom_event(platform)) is True
+
+
+def test_pre_core_authorization_denies_without_matching_allowlist(monkeypatch):
+    monkeypatch.setenv("WECOM_ALLOWED_USERS", "other-user")
+
+    assert is_wecom_pre_core_authorized(_wecom_event(Platform.WECOM)) is False
+
+
+@pytest.mark.parametrize("env_name", ["WECOM_ALLOWED_USERS", "GATEWAY_ALLOWED_USERS"])
+def test_pre_core_authorization_does_not_match_chat_id_as_user(monkeypatch, env_name):
+    monkeypatch.setenv(env_name, "group-1")
+
+    event = _wecom_event(Platform.WECOM, user_id="user-2", chat_id="group-1")
+
+    assert is_wecom_pre_core_authorized(event) is False
+
+
+def test_pre_core_authorization_rejects_group_prefixed_user_allowlist(monkeypatch):
+    monkeypatch.setenv("WECOM_ALLOWED_USERS", "group:zhangsan")
+
+    assert is_wecom_pre_core_authorized(_wecom_event(Platform.WECOM)) is False
+
+
 @pytest.mark.asyncio
-async def test_wecom_event_posts_core_inbound_and_learns_chat_mapping():
+async def test_wecom_event_posts_core_inbound_and_learns_chat_mapping(monkeypatch):
+    monkeypatch.setenv("WECOM_CALLBACK_ALLOW_ALL_USERS", "1")
     sent = []
 
     async def fake_send(chat_id, content):
@@ -173,6 +245,125 @@ async def test_wecom_event_posts_core_inbound_and_learns_chat_mapping():
         "media": [],
         "received_at": "2026-06-02T12:00:00Z",
     }
+
+
+@pytest.mark.asyncio
+async def test_wecom_event_denied_before_core_write_without_allowlist(monkeypatch):
+    monkeypatch.delenv("WECOM_CALLBACK_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+    client = FakeCoreClient()
+    bridge = YouPetBridge(_settings(), AsyncMock())
+    bridge._client = client
+
+    skip_agent = await bridge.handle_wecom_event(_event(), {"corp_id": "ww1234567890"})
+
+    assert skip_agent is True
+    assert client.post_calls == []
+
+
+@pytest.mark.asyncio
+async def test_wecom_group_image_event_posts_metadata_only(monkeypatch):
+    monkeypatch.setenv("WECOM_ALLOW_ALL_USERS", "1")
+    source = SessionSource(
+        platform=Platform.WECOM,
+        chat_id="group-1",
+        chat_type="group",
+        user_id="zhangsan",
+        user_name="zhangsan",
+    )
+    event = MessageEvent(
+        text="",
+        message_type=MessageType.PHOTO,
+        source=source,
+        raw_message={
+            "body": {
+                "msgid": "group-msg-1",
+                "chatid": "group-1",
+                "chattype": "group",
+                "from": {"userid": "zhangsan"},
+                "msgtype": "image",
+                "image": {
+                    "media_id": "img-media-1",
+                    "filename": "checkin.jpg",
+                    "size": "12345",
+                    "url": "https://wecom.example/media",
+                },
+            }
+        },
+        message_id="group-msg-1",
+        timestamp=datetime(2026, 6, 2, 12, 1, tzinfo=UTC),
+    )
+    client = FakeCoreClient()
+    bridge = YouPetBridge(_settings(corp_id="ww-group"), AsyncMock())
+    bridge._client = client
+
+    skip_agent = await bridge.handle_wecom_event(event, {})
+
+    assert skip_agent is True
+    call = client.post_calls[0]
+    assert call["json"] == {
+        "corp_id": "ww-group",
+        "source": "hermes_wecom",
+        "conversation_type": "group",
+        "wecom_user_id": "zhangsan",
+        "wecom_group_id": "group-1",
+        "message_id": "group-msg-1",
+        "message_type": "image",
+        "text": None,
+        "media": [
+            {
+                "media_type": "image",
+                "wecom_media_id": "img-media-1",
+                "filename": "checkin.jpg",
+                "size_bytes": 12345,
+            }
+        ],
+        "received_at": "2026-06-02T12:01:00Z",
+    }
+
+
+@pytest.mark.asyncio
+async def test_wecom_callback_image_event_posts_metadata_only(monkeypatch):
+    monkeypatch.setenv("WECOM_CALLBACK_ALLOWED_USERS", "zhangsan")
+    source = SessionSource(
+        platform=Platform.WECOM_CALLBACK,
+        chat_id="ww1234567890:zhangsan",
+        chat_type="dm",
+        user_id="zhangsan",
+        user_name="zhangsan",
+    )
+    event = MessageEvent(
+        text="",
+        message_type=MessageType.PHOTO,
+        source=source,
+        raw_message="""
+        <xml>
+          <ToUserName>ww1234567890</ToUserName>
+          <FromUserName>zhangsan</FromUserName>
+          <CreateTime>1710000000</CreateTime>
+          <MsgType>image</MsgType>
+          <MediaId>callback-image-1</MediaId>
+          <PicUrl>https://wecom.example/callback-image</PicUrl>
+          <MsgId>m-callback-image</MsgId>
+        </xml>
+        """,
+        message_id="m-callback-image",
+        timestamp=datetime(2026, 6, 2, 12, 2, tzinfo=UTC),
+    )
+    client = FakeCoreClient()
+    bridge = YouPetBridge(_settings(), AsyncMock())
+    bridge._client = client
+
+    skip_agent = await bridge.handle_wecom_event(event, {"corp_id": "ww1234567890"})
+
+    assert skip_agent is True
+    assert client.post_calls[0]["json"]["media"] == [
+        {
+            "media_type": "image",
+            "wecom_media_id": "callback-image-1",
+        }
+    ]
+    assert client.post_calls[0]["json"]["message_type"] == "image"
 
 
 @pytest.mark.asyncio

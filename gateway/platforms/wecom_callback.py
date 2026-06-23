@@ -417,7 +417,7 @@ class WecomCallbackAdapter(BasePlatformAdapter):
             event_name = (root.findtext("Event") or "").lower()
             if event_name in {"enter_agent", "subscribe"}:
                 return None
-        if msg_type not in {"text", "event"}:
+        if msg_type not in {"text", "image", "event"}:
             return None
 
         user_id = root.findtext("FromUserName", default="")
@@ -439,7 +439,7 @@ class WecomCallbackAdapter(BasePlatformAdapter):
         )
         return MessageEvent(
             text=content,
-            message_type=MessageType.TEXT,
+            message_type=MessageType.PHOTO if msg_type == "image" else MessageType.TEXT,
             source=source,
             raw_message=xml_text,
             message_id=msg_id,

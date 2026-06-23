@@ -47,6 +47,13 @@ class MessageDeduplicator:
 
     def is_duplicate(self, msg_id: str) -> bool:
         """Return True if *msg_id* was already seen within the TTL window."""
+        if self.was_seen(msg_id):
+            return True
+        self.mark_seen(msg_id)
+        return False
+
+    def was_seen(self, msg_id: str) -> bool:
+        """Return True if *msg_id* is currently remembered without mutating."""
         if not msg_id:
             return False
         now = time.time()
@@ -55,6 +62,13 @@ class MessageDeduplicator:
                 return True
             # Entry has expired — remove it and treat as new
             del self._seen[msg_id]
+        return False
+
+    def mark_seen(self, msg_id: str) -> None:
+        """Remember *msg_id* as successfully consumed."""
+        if not msg_id:
+            return
+        now = time.time()
         self._seen[msg_id] = now
         if len(self._seen) > self._max_size:
             cutoff = now - self._ttl
@@ -68,7 +82,6 @@ class MessageDeduplicator:
                     key=lambda item: item[1],
                 )[-self._max_size:]
                 self._seen = dict(newest)
-        return False
 
     def clear(self):
         """Clear all tracked messages."""

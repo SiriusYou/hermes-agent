@@ -768,6 +768,214 @@ class TestWeComZombieSessionFix:
         adapter.handle_message.assert_not_awaited()
         assert "group-blocked" not in adapter._last_chat_req_ids
 
+    @pytest.mark.asyncio
+    async def test_youpet_bridge_group_message_skips_agent_without_media_cache(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        class FakeBridge:
+            def __init__(self):
+                self.settings = SimpleNamespace(corp_id="ww-test")
+                self.calls = []
+
+            async def handle_wecom_event(self, event, app):
+                self.calls.append((event, app))
+                return True
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._text_batch_delay_seconds = 0
+        adapter._youpet_bridge = FakeBridge()
+        adapter.handle_message = AsyncMock()
+        adapter._extract_media = AsyncMock(side_effect=AssertionError("must not cache bridge media"))
+
+        payload = {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-img"},
+            "body": {
+                "msgid": "msg-img-1",
+                "chatid": "group-1",
+                "chattype": "group",
+                "from": {"userid": "user-1"},
+                "msgtype": "image",
+                "image": {
+                    "media_id": "media-1",
+                    "url": "https://wecom.example/media-1",
+                },
+            },
+        }
+
+        await adapter._on_message(payload)
+
+        adapter.handle_message.assert_not_awaited()
+        adapter._extract_media.assert_not_awaited()
+        assert len(adapter._youpet_bridge.calls) == 1
+        event, app = adapter._youpet_bridge.calls[0]
+        assert app == {"corp_id": "ww-test"}
+        assert event.message_id == "msg-img-1"
+        assert event.source.chat_type == "group"
+        assert event.source.chat_id == "group-1"
+
+    @pytest.mark.asyncio
+    async def test_youpet_bridge_file_only_message_uses_legacy_media_path(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        bridge = SimpleNamespace(
+            settings=SimpleNamespace(corp_id="ww-test"),
+            handle_wecom_event=AsyncMock(return_value=True),
+        )
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._text_batch_delay_seconds = 0
+        adapter._youpet_bridge = bridge
+        adapter.handle_message = AsyncMock()
+        adapter._extract_media = AsyncMock(return_value=(["/tmp/doc.pdf"], ["application/pdf"]))
+
+        payload = {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-file"},
+            "body": {
+                "msgid": "msg-file-1",
+                "chatid": "group-1",
+                "chattype": "group",
+                "from": {"userid": "user-1"},
+                "msgtype": "file",
+                "file": {
+                    "media_id": "file-1",
+                    "filename": "doc.pdf",
+                },
+            },
+        }
+
+        await adapter._on_message(payload)
+
+        bridge.handle_wecom_event.assert_not_awaited()
+        adapter._extract_media.assert_awaited_once()
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.message_id == "msg-file-1"
+        assert event.media_urls == ["/tmp/doc.pdf"]
+        assert event.media_types == ["application/pdf"]
+
+    @pytest.mark.asyncio
+    async def test_youpet_bridge_appmsg_file_with_title_uses_legacy_media_path(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        bridge = SimpleNamespace(
+            settings=SimpleNamespace(corp_id="ww-test"),
+            handle_wecom_event=AsyncMock(return_value=True),
+        )
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._text_batch_delay_seconds = 0
+        adapter._youpet_bridge = bridge
+        adapter.handle_message = AsyncMock()
+        adapter._extract_media = AsyncMock(return_value=(["/tmp/report.pdf"], ["application/pdf"]))
+
+        payload = {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-appmsg-file"},
+            "body": {
+                "msgid": "msg-appmsg-file-1",
+                "chatid": "group-1",
+                "chattype": "group",
+                "from": {"userid": "user-1"},
+                "msgtype": "appmsg",
+                "appmsg": {
+                    "title": "report.pdf",
+                    "file": {
+                        "media_id": "file-2",
+                        "filename": "report.pdf",
+                    },
+                },
+            },
+        }
+
+        await adapter._on_message(payload)
+
+        bridge.handle_wecom_event.assert_not_awaited()
+        adapter._extract_media.assert_awaited_once()
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "report.pdf"
+        assert event.message_id == "msg-appmsg-file-1"
+        assert event.media_urls == ["/tmp/report.pdf"]
+        assert event.media_types == ["application/pdf"]
+
+    @pytest.mark.asyncio
+    async def test_youpet_bridge_transient_failure_does_not_poison_ai_bot_dedup(self):
+        from gateway.integrations.youpet import YouPetBridgeError
+        from gateway.platforms.wecom import WeComAdapter
+
+        class FlakyBridge:
+            def __init__(self):
+                self.settings = SimpleNamespace(corp_id="ww-test")
+                self.calls = 0
+
+            async def handle_wecom_event(self, event, app):
+                self.calls += 1
+                if self.calls == 1:
+                    raise YouPetBridgeError("core unavailable")
+                return True
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._text_batch_delay_seconds = 0
+        adapter._youpet_bridge = FlakyBridge()
+        adapter.handle_message = AsyncMock()
+        adapter._extract_media = AsyncMock(return_value=([], []))
+
+        payload = {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-retry"},
+            "body": {
+                "msgid": "msg-retry-1",
+                "chatid": "user-1",
+                "chattype": "single",
+                "from": {"userid": "user-1"},
+                "msgtype": "text",
+                "text": {"content": "done"},
+            },
+        }
+
+        await adapter._on_message(payload)
+        await adapter._on_message(payload)
+        await adapter._on_message(payload)
+
+        assert adapter._youpet_bridge.calls == 2
+        adapter.handle_message.assert_not_awaited()
+        adapter._extract_media.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_youpet_bridge_not_called_for_denied_group_policy(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        bridge = SimpleNamespace(
+            settings=SimpleNamespace(corp_id="ww-test"),
+            handle_wecom_event=AsyncMock(return_value=True),
+        )
+        adapter = WeComAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={"group_policy": "allowlist", "group_allow_from": ["group-ok"]},
+            )
+        )
+        adapter._youpet_bridge = bridge
+        adapter.handle_message = AsyncMock()
+
+        payload = {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-blocked"},
+            "body": {
+                "msgid": "msg-blocked-1",
+                "chatid": "group-blocked",
+                "chattype": "group",
+                "from": {"userid": "user-1"},
+                "msgtype": "text",
+                "text": {"content": "hi"},
+            },
+        }
+
+        await adapter._on_message(payload)
+
+        bridge.handle_wecom_event.assert_not_awaited()
+        adapter.handle_message.assert_not_awaited()
+
     def test_remember_chat_req_id_is_bounded(self):
         from gateway.platforms.wecom import DEDUP_MAX_SIZE, WeComAdapter
 

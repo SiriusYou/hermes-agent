@@ -6,14 +6,20 @@ import asyncio
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional, TypedDict
 
 import httpx
+try:
+    import defusedxml.ElementTree as ET
+except ImportError:  # pragma: no cover - callback adapter already requires defusedxml
+    ET = None  # type: ignore[assignment]
 
 from hermes_constants import get_hermes_home
+from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, SendResult
 from utils import atomic_replace
 
@@ -60,6 +66,7 @@ class YouPetBridgeSettings:
     outbox_limit: int = 20
     skip_agent_dispatch: bool = True
     ack_unhandled_events: bool = True
+    corp_id: Optional[str] = None
     default_chat_id: Optional[str] = None
     user_chat_map: dict[str, str] = field(default_factory=dict)
 
@@ -115,6 +122,11 @@ def youpet_settings_from_env() -> YouPetBridgeSettings:
         outbox_limit=_env_int("YOUPET_OUTBOX_LIMIT", default=20),
         skip_agent_dispatch=_env_bool("YOUPET_WECOM_SKIP_AGENT_DISPATCH", default=True),
         ack_unhandled_events=_env_bool("YOUPET_OUTBOX_ACK_UNHANDLED_EVENTS", default=True),
+        corp_id=(
+            os.getenv("YOUPET_WECOM_CORP_ID")
+            or os.getenv("WECOM_CALLBACK_CORP_ID")
+            or None
+        ),
         default_chat_id=os.getenv("YOUPET_WECOM_DEFAULT_CHAT_ID") or None,
         user_chat_map=user_chat_map,
     )
@@ -159,6 +171,15 @@ class YouPetBridge:
     async def handle_wecom_event(self, event: MessageEvent, app: dict[str, Any]) -> bool:
         if not self.settings.configured:
             return False
+        if not is_wecom_pre_core_authorized(event):
+            source = event.source
+            logger.info(
+                "[YouPetBridge] Ignoring unauthorized WeCom inbound user=%s chat=%s platform=%s",
+                getattr(source, "user_id", None),
+                getattr(source, "chat_id", None),
+                getattr(getattr(source, "platform", None), "value", getattr(source, "platform", None)),
+            )
+            return True
         payload = self._build_inbound_payload(event, app)
         response = await self._post(
             "/api/v1/wecom/inbound",
@@ -237,20 +258,24 @@ class YouPetBridge:
 
     def _build_inbound_payload(self, event: MessageEvent, app: dict[str, Any]) -> dict[str, Any]:
         source = event.source
-        corp_id = str(app.get("corp_id") or "")
+        corp_id = str(app.get("corp_id") or self.settings.corp_id or "")
         if not corp_id and source and source.chat_id and ":" in source.chat_id:
             corp_id = source.chat_id.split(":", 1)[0]
         user_id = str(getattr(source, "user_id", "") or "")
+        chat_type = str(getattr(source, "chat_type", "") or "").lower()
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        media = _wecom_media_metadata(event)
+        message_type = _core_message_type(event, media)
         return {
             "corp_id": corp_id,
             "source": self.settings.source,
-            "conversation_type": "dm",
+            "conversation_type": "group" if chat_type == "group" else "dm",
             "wecom_user_id": user_id or None,
-            "wecom_group_id": None,
+            "wecom_group_id": chat_id if chat_type == "group" else None,
             "message_id": str(event.message_id or ""),
-            "message_type": getattr(event.message_type, "value", str(event.message_type)),
+            "message_type": message_type,
             "text": event.text or None,
-            "media": [],
+            "media": media,
             "received_at": _iso_utc(event.timestamp),
         }
 
@@ -457,6 +482,169 @@ def _env_float(name: str, *, default: float) -> float:
         return float(raw)
     except ValueError:
         return default
+
+
+def is_wecom_pre_core_authorized(event: MessageEvent) -> bool:
+    """Return True when a WeCom inbound message may be written to Core.
+
+    The normal gateway allowlist check runs after adapter dispatch. The YouPet
+    bridge writes to Core before that boundary, so it needs the same env
+    allowlist/allow-all contract at the bridge edge.
+    """
+    source = event.source
+    if not source:
+        return False
+    platform = getattr(source, "platform", None)
+    if platform == Platform.WECOM_CALLBACK:
+        env_prefix = "WECOM_CALLBACK"
+    elif platform == Platform.WECOM:
+        env_prefix = "WECOM"
+    else:
+        return False
+
+    if _env_bool(f"{env_prefix}_ALLOW_ALL_USERS", default=False):
+        return True
+    if _env_bool("GATEWAY_ALLOW_ALL_USERS", default=False):
+        return True
+
+    user_id = str(getattr(source, "user_id", "") or "").strip()
+    allowed = _env_entries(f"{env_prefix}_ALLOWED_USERS") + _env_entries("GATEWAY_ALLOWED_USERS")
+    if not allowed:
+        return False
+    return _entry_matches_any(allowed, [user_id])
+
+
+def _env_entries(name: str) -> list[str]:
+    return [item.strip() for item in os.getenv(name, "").split(",") if item.strip()]
+
+
+def _normalize_allow_entry(value: str) -> str:
+    normalized = str(value or "").strip()
+    normalized = re.sub(r"^wecom(_callback)?:", "", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"^user:", "", normalized, flags=re.IGNORECASE)
+    return normalized.strip().lower()
+
+
+def _entry_matches_any(entries: list[str], targets: list[str]) -> bool:
+    normalized_targets = {_normalize_allow_entry(target) for target in targets if str(target or "").strip()}
+    for entry in entries:
+        normalized = _normalize_allow_entry(entry)
+        if normalized == "*" or normalized in normalized_targets:
+            return True
+    return False
+
+
+def _core_message_type(event: MessageEvent, media: list[dict[str, Any]]) -> str:
+    raw = getattr(event.message_type, "value", str(event.message_type))
+    if raw == "photo" and any(item.get("media_type") == "image" for item in media):
+        return "image"
+    return raw
+
+
+def _wecom_media_metadata(event: MessageEvent) -> list[dict[str, Any]]:
+    raw = event.raw_message
+    if isinstance(raw, dict):
+        body = raw.get("body") if isinstance(raw.get("body"), dict) else raw
+        return _media_metadata_from_wecom_body(body)
+    if isinstance(raw, str):
+        return _media_metadata_from_callback_xml(raw)
+    return []
+
+
+def _media_metadata_from_callback_xml(xml_text: str) -> list[dict[str, Any]]:
+    if ET is None:
+        return []
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception:
+        return []
+    msg_type = (root.findtext("MsgType") or "").lower()
+    if msg_type != "image":
+        return []
+    media_id = root.findtext("MediaId") or root.findtext("PicUrl") or ""
+    item = _media_metadata_item(
+        "image",
+        {
+            "media_id": media_id,
+            "filename": root.findtext("FileName"),
+            "size": root.findtext("FileSize") or root.findtext("Size"),
+        },
+    )
+    return [item] if item else []
+
+
+def _media_metadata_from_wecom_body(body: dict[str, Any]) -> list[dict[str, Any]]:
+    refs: list[tuple[str, dict[str, Any]]] = []
+    msg_type = str(body.get("msgtype") or "").lower()
+    if msg_type == "mixed":
+        mixed = body.get("mixed") if isinstance(body.get("mixed"), dict) else {}
+        items = mixed.get("msg_item") if isinstance(mixed.get("msg_item"), list) else []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("msgtype") or "").lower() == "image" and isinstance(item.get("image"), dict):
+                refs.append(("image", item["image"]))
+    else:
+        if isinstance(body.get("image"), dict):
+            refs.append(("image", body["image"]))
+        appmsg = body.get("appmsg") if isinstance(body.get("appmsg"), dict) else {}
+        if isinstance(appmsg.get("image"), dict):
+            refs.append(("image", appmsg["image"]))
+
+    quote = body.get("quote") if isinstance(body.get("quote"), dict) else {}
+    if str(quote.get("msgtype") or "").lower() == "image" and isinstance(quote.get("image"), dict):
+        refs.append(("image", quote["image"]))
+
+    metadata: list[dict[str, Any]] = []
+    for kind, ref in refs:
+        item = _media_metadata_item(kind, ref)
+        if item:
+            metadata.append(item)
+    return metadata
+
+
+def _media_metadata_item(kind: str, ref: dict[str, Any]) -> Optional[dict[str, Any]]:
+    if kind != "image":
+        return None
+    media_id = _first_str(ref, ("media_id", "mediaid", "id", "file_id", "url"))
+    if not media_id:
+        return None
+    item: dict[str, Any] = {
+        "media_type": "image",
+        "wecom_media_id": media_id,
+    }
+    filename = _first_str(ref, ("filename", "name", "title"))
+    if filename:
+        item["filename"] = filename
+    size = _first_int(ref, ("size_bytes", "size", "filesize", "file_size"))
+    if size is not None:
+        item["size_bytes"] = size
+    return item
+
+
+def _first_str(payload: dict[str, Any], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = payload.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
+def _first_int(payload: dict[str, Any], keys: tuple[str, ...]) -> Optional[int]:
+    for key in keys:
+        value = payload.get(key)
+        if value is None or value == "":
+            continue
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed >= 0:
+            return parsed
+    return None
 
 
 def _iso_utc(value: datetime) -> str:

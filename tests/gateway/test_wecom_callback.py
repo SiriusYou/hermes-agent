@@ -11,6 +11,7 @@ import pytest
 
 from gateway.config import PlatformConfig
 from gateway.integrations.youpet import YouPetBridgeError
+from gateway.platforms.base import MessageType
 from gateway.platforms.wecom_callback import (
     MAX_PERSISTED_DEDUP_ENTRIES,
     MESSAGE_DEDUP_TTL_SECONDS,
@@ -149,6 +150,28 @@ class TestWecomCallbackEventConstruction:
         assert event.source.chat_id == "ww1234567890:zhangsan"
         assert event.message_id == "123456789"
         assert event.text == "\u4f60\u597d"
+
+    def test_build_event_extracts_image_message_for_metadata_bridge(self):
+        adapter = WecomCallbackAdapter(_config())
+        xml_text = """
+        <xml>
+          <ToUserName>ww1234567890</ToUserName>
+          <FromUserName>zhangsan</FromUserName>
+          <CreateTime>1710000000</CreateTime>
+          <MsgType>image</MsgType>
+          <MediaId>media-callback-1</MediaId>
+          <PicUrl>https://wecom.example/image</PicUrl>
+          <MsgId>img-123</MsgId>
+        </xml>
+        """
+        event = adapter._build_event(_app(), xml_text)
+        assert event is not None
+        assert event.source is not None
+        assert event.source.user_id == "zhangsan"
+        assert event.source.chat_id == "ww1234567890:zhangsan"
+        assert event.message_id == "img-123"
+        assert event.text == ""
+        assert event.message_type == MessageType.PHOTO
 
     def test_build_event_returns_none_for_subscribe(self):
         adapter = WecomCallbackAdapter(_config())

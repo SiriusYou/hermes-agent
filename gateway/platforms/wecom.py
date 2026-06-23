@@ -59,6 +59,7 @@ except ImportError:
     httpx = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.integrations.youpet import YouPetBridge, YouPetBridgeError, youpet_settings_from_env
 from gateway.platforms.helpers import MessageDeduplicator
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -175,6 +176,7 @@ class WeComAdapter(BasePlatformAdapter):
         self._pending_responses: Dict[str, asyncio.Future] = {}
         self._dedup = MessageDeduplicator(max_size=DEDUP_MAX_SIZE)
         self._reply_req_ids: Dict[str, str] = {}
+        self._youpet_bridge = self._build_youpet_bridge()
 
         # Text batching: merge rapid successive messages (Telegram-style).
         # WeCom clients split long messages around 4000 chars.
@@ -256,9 +258,21 @@ class WeComAdapter(BasePlatformAdapter):
         if self._http_client:
             await self._http_client.aclose()
             self._http_client = None
+        if self._youpet_bridge:
+            await self._youpet_bridge.stop()
 
         self._dedup.clear()
         logger.info("[%s] Disconnected", self.name)
+
+    def _build_youpet_bridge(self) -> Optional[YouPetBridge]:
+        settings = youpet_settings_from_env()
+        if not settings.enabled:
+            return None
+        # The AI Bot adapter only uses the bridge for inbound DM/group writes.
+        # Outbox polling remains owned by the callback bridge to avoid duplicate
+        # consumers when both WeCom surfaces are enabled.
+        settings.outbox_poll_enabled = False
+        return YouPetBridge(settings, self.send)
 
     async def _cleanup_ws(self) -> None:
         """Close the live websocket/session, if any."""
@@ -488,7 +502,11 @@ class WeComAdapter(BasePlatformAdapter):
             return
 
         msg_id = str(body.get("msgid") or self._payload_req_id(payload) or uuid.uuid4().hex)
-        if self._dedup.is_duplicate(msg_id):
+        if self._youpet_bridge:
+            if self._dedup.was_seen(msg_id):
+                logger.debug("[%s] Duplicate message %s ignored", self.name, msg_id)
+                return
+        elif self._dedup.is_duplicate(msg_id):
             logger.debug("[%s] Duplicate message %s ignored", self.name, msg_id)
             return
         self._remember_reply_req_id(msg_id, self._payload_req_id(payload))
@@ -520,6 +538,40 @@ class WeComAdapter(BasePlatformAdapter):
         # Mirrors what the Telegram adapter does (re.sub @botname).
         if is_group and text:
             text = re.sub(r"^@\S+\s*", "", text).strip()
+        has_youpet_media = self._has_youpet_media_reference(body)
+        has_legacy_media = self._has_legacy_media_reference(body)
+        bridge_message_type = MessageType.PHOTO if has_youpet_media and not text else MessageType.TEXT
+        if not text and reply_text and not has_youpet_media:
+            text = reply_text
+
+        source = self.build_source(
+            chat_id=chat_id,
+            chat_type="group" if is_group else "dm",
+            user_id=sender_id or None,
+            user_name=sender_id or None,
+        )
+
+        if self._youpet_bridge and not has_legacy_media and (text or has_youpet_media):
+            bridge_event = MessageEvent(
+                text=text,
+                message_type=bridge_message_type,
+                source=source,
+                raw_message=payload,
+                message_id=msg_id,
+                timestamp=datetime.now(tz=timezone.utc),
+            )
+            try:
+                skip_agent_dispatch = await self._youpet_bridge.handle_wecom_event(
+                    bridge_event,
+                    {"corp_id": self._youpet_bridge.settings.corp_id or ""},
+                )
+            except YouPetBridgeError as exc:
+                logger.warning("[%s] YouPet bridge failed for %s: %s", self.name, msg_id, exc)
+                return
+            if skip_agent_dispatch:
+                self._dedup.mark_seen(msg_id)
+                return
+
         media_urls, media_types = await self._extract_media(body)
         message_type = self._derive_message_type(body, text, media_types)
         has_reply_context = bool(reply_text and (text or media_urls))
@@ -530,13 +582,6 @@ class WeComAdapter(BasePlatformAdapter):
         if not text and not media_urls:
             logger.debug("[%s] Empty WeCom message skipped", self.name)
             return
-
-        source = self.build_source(
-            chat_id=chat_id,
-            chat_type="group" if is_group else "dm",
-            user_id=sender_id or None,
-            user_name=sender_id or None,
-        )
 
         event = MessageEvent(
             text=text,
@@ -557,6 +602,8 @@ class WeComAdapter(BasePlatformAdapter):
             self._enqueue_text_event(event)
         else:
             await self.handle_message(event)
+        if self._youpet_bridge:
+            self._dedup.mark_seen(msg_id)
 
     # ------------------------------------------------------------------
     # Text message aggregation (handles WeCom client-side splits)
@@ -737,6 +784,46 @@ class WeComAdapter(BasePlatformAdapter):
                 media_types.append(content_type)
 
         return media_paths, media_types
+
+    @staticmethod
+    def _has_youpet_media_reference(body: Dict[str, Any]) -> bool:
+        """Return True when the body carries media metadata for the YouPet bridge."""
+        msgtype = str(body.get("msgtype") or "").lower()
+        if msgtype == "mixed":
+            mixed = body.get("mixed") if isinstance(body.get("mixed"), dict) else {}
+            items = mixed.get("msg_item") if isinstance(mixed.get("msg_item"), list) else []
+            return any(
+                isinstance(item, dict)
+                and str(item.get("msgtype") or "").lower() == "image"
+                and isinstance(item.get("image"), dict)
+                for item in items
+            )
+        if isinstance(body.get("image"), dict):
+            return True
+        appmsg = body.get("appmsg") if isinstance(body.get("appmsg"), dict) else {}
+        if isinstance(appmsg.get("image"), dict):
+            return True
+        quote = body.get("quote") if isinstance(body.get("quote"), dict) else {}
+        return str(quote.get("msgtype") or "").lower() == "image" and isinstance(
+            quote.get("image"),
+            dict,
+        )
+
+    @staticmethod
+    def _has_legacy_media_reference(body: Dict[str, Any]) -> bool:
+        """Return True when media should use the existing binary cache path."""
+        msgtype = str(body.get("msgtype") or "").lower()
+        if msgtype == "file" and isinstance(body.get("file"), dict):
+            return True
+        if msgtype == "appmsg" and isinstance(body.get("appmsg"), dict):
+            appmsg = body["appmsg"]
+            if isinstance(appmsg.get("file"), dict):
+                return True
+        quote = body.get("quote") if isinstance(body.get("quote"), dict) else {}
+        return str(quote.get("msgtype") or "").lower() == "file" and isinstance(
+            quote.get("file"),
+            dict,
+        )
 
     async def _cache_media(self, kind: str, media: Dict[str, Any]) -> Optional[Tuple[str, str]]:
         """Cache an inbound image/file/media reference to local storage."""
