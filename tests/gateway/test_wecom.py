@@ -74,6 +74,23 @@ class TestWeComAdapterInit:
         assert adapter._secret == "env-secret"
         assert adapter._ws_url == "wss://env.example/ws"
 
+    def test_env_loader_bridges_allowed_users_to_dm_policy(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("WECOM_BOT_ID", "env-bot")
+        monkeypatch.setenv("WECOM_SECRET", "env-secret")
+        monkeypatch.setenv("WECOM_DM_POLICY", "allowlist")
+        monkeypatch.setenv("WECOM_ALLOWED_USERS", "YouJia")
+        from gateway.config import Platform, load_gateway_config
+        from gateway.platforms.wecom import WeComAdapter
+
+        config = load_gateway_config().platforms[Platform.WECOM]
+        adapter = WeComAdapter(config)
+
+        assert adapter._dm_policy == "allowlist"
+        assert adapter._allow_from == ["YouJia"]
+        assert adapter._is_dm_allowed("YouJia") is True
+        assert adapter._is_dm_allowed("stranger") is False
+
 
 class TestWeComConnect:
     @pytest.mark.asyncio
