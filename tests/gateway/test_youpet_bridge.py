@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
@@ -9,6 +10,7 @@ import pytest
 
 from gateway.config import Platform
 from gateway.integrations.youpet import (
+    MAX_PROCESSED_EVENT_IDS,
     YouPetBridge,
     YouPetBridgeSettings,
     is_wecom_pre_core_authorized,
@@ -664,6 +666,409 @@ async def test_poll_once_dedupes_processed_event_id():
         if call["url"].endswith(f"/internal/events/outbox/{event_id}/ack")
     ]
     assert len(ack_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_poll_once_dedupes_by_business_payload_event_id_when_row_ids_change():
+    sent = []
+
+    async def fake_send(chat_id, content):
+        sent.append((chat_id, content))
+        return SendResult(success=True)
+
+    event_type = "task.reminder_due"
+    payload = {
+        "task_id": "task-5",
+        "recipient_user_id": "user-123",
+        "message_context": {"pet_name": "Mochi", "plan_title": "care task"},
+    }
+    first_item = _outbox_item(
+        "11111111-1111-1111-8111-111111111111",
+        event_type,
+        payload,
+    )
+    first_item["payload"]["event_id"] = "business-task-5"
+
+    second_item = _outbox_item(
+        "22222222-2222-2222-8222-222222222222",
+        event_type,
+        payload,
+    )
+    second_item["payload"]["event_id"] = "business-task-5"
+
+    client = FakeCoreClient(outbox_items=[first_item])
+    bridge = YouPetBridge(
+        _settings(user_chat_map={"user-123": "ww1234567890:zhangsan"}),
+        fake_send,
+    )
+    bridge._client = client
+
+    await bridge.poll_once()
+
+    client.outbox_items = [second_item]
+    await bridge.poll_once()
+
+    assert len(sent) == 1
+    ack_calls = [
+        call
+        for call in client.post_calls
+        if call["url"].endswith("/ack")
+    ]
+    assert len(ack_calls) == 2
+    assert client.post_calls[0]["url"].endswith(
+        "/internal/events/outbox/11111111-1111-1111-8111-111111111111/ack"
+    )
+    assert client.post_calls[1]["url"].endswith(
+        "/internal/events/outbox/22222222-2222-2222-8222-222222222222/ack"
+    )
+    assert "business-task-5" in bridge._processed_event_ids
+    assert "11111111-1111-1111-8111-111111111111" not in bridge._processed_event_ids
+    assert "22222222-2222-2222-8222-222222222222" not in bridge._processed_event_ids
+
+
+@pytest.mark.asyncio
+async def test_poll_once_dedupes_legacy_delivery_id_and_backfills_business_event_id():
+    sent = []
+
+    async def fake_send(chat_id, content):
+        sent.append((chat_id, content))
+        return SendResult(success=True)
+
+    delivery_id = "12121212-1212-4212-8212-121212121212"
+    business_event_id = "business-task-legacy"
+    state_path = YouPetBridge._processed_event_state_path()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps({"event_ids": [delivery_id]}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    item = _outbox_item(
+        delivery_id,
+        "task.reminder_due",
+        {
+            "task_id": "task-legacy",
+            "recipient_user_id": "user-123",
+            "message_context": {"pet_name": "Mochi", "plan_title": "care task"},
+        },
+    )
+    item["payload"]["event_id"] = business_event_id
+
+    client = FakeCoreClient(outbox_items=[item])
+    bridge = YouPetBridge(
+        _settings(user_chat_map={"user-123": "ww1234567890:zhangsan"}),
+        fake_send,
+    )
+    bridge._client = client
+
+    counts = await bridge.poll_once()
+
+    assert counts == _counts(pulled=1, processed=1, acked=1)
+    assert sent == []
+    assert client.post_calls == [
+        {
+            "url": "http://youpet-core.test/internal/events/outbox/12121212-1212-4212-8212-121212121212/ack",
+            "params": {"consumer": "hermes"},
+            "headers": {
+                "Authorization": "Bearer service-token",
+                "X-Actor-Id": "hermes-wecom-bridge",
+            },
+        }
+    ]
+    assert bridge._processed_event_id_order == [business_event_id]
+    assert business_event_id in bridge._processed_event_ids
+    assert delivery_id not in bridge._processed_event_ids
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    assert persisted["event_ids"] == bridge._processed_event_id_order
+
+
+@pytest.mark.asyncio
+async def test_poll_once_removes_redundant_legacy_key_when_canonical_key_already_exists():
+    sent = []
+
+    async def fake_send(chat_id, content):
+        sent.append((chat_id, content))
+        return SendResult(success=True)
+
+    leading_event_id = "business-leading"
+    delivery_id = "13131313-1313-4131-8131-131313131313"
+    business_event_id = "business-task-mixed"
+    trailing_event_id = "business-trailing"
+    expected_event_ids = [
+        leading_event_id,
+        business_event_id,
+        trailing_event_id,
+    ]
+    state_path = YouPetBridge._processed_event_state_path()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "event_ids": [
+                    leading_event_id,
+                    delivery_id,
+                    business_event_id,
+                    trailing_event_id,
+                ]
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    item = _outbox_item(
+        delivery_id,
+        "task.reminder_due",
+        {
+            "task_id": "task-mixed",
+            "recipient_user_id": "user-123",
+            "message_context": {"pet_name": "Mochi", "plan_title": "care task"},
+        },
+    )
+    item["payload"]["event_id"] = business_event_id
+
+    client = FakeCoreClient(outbox_items=[item])
+    bridge = YouPetBridge(
+        _settings(user_chat_map={"user-123": "ww1234567890:zhangsan"}),
+        fake_send,
+    )
+    bridge._client = client
+
+    counts = await bridge.poll_once()
+
+    assert counts == _counts(pulled=1, processed=1, acked=1)
+    assert sent == []
+    assert client.post_calls == [
+        {
+            "url": "http://youpet-core.test/internal/events/outbox/13131313-1313-4131-8131-131313131313/ack",
+            "params": {"consumer": "hermes"},
+            "headers": {
+                "Authorization": "Bearer service-token",
+                "X-Actor-Id": "hermes-wecom-bridge",
+            },
+        }
+    ]
+    assert bridge._processed_event_id_order == expected_event_ids
+    assert bridge._processed_event_id_order.count(business_event_id) == 1
+    assert delivery_id not in bridge._processed_event_ids
+    assert business_event_id in bridge._processed_event_ids
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    assert persisted["event_ids"] == bridge._processed_event_id_order
+
+
+@pytest.mark.asyncio
+async def test_poll_once_backfills_full_legacy_ledger_without_eviction_or_duplicate_send():
+    sent = []
+
+    async def fake_send(chat_id, content):
+        sent.append((chat_id, content))
+        return SendResult(success=True)
+
+    oldest_delivery_id = "01010101-0101-4101-8101-010101010101"
+    oldest_business_event_id = "business-task-oldest"
+    current_delivery_id = "02020202-0202-4202-8202-020202020202"
+    current_business_event_id = "business-task-current"
+    filler_event_ids = [
+        f"business-filler-{index:04d}"
+        for index in range(MAX_PROCESSED_EVENT_IDS - 2)
+    ]
+    state_path = YouPetBridge._processed_event_state_path()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "event_ids": [
+                    oldest_delivery_id,
+                    current_delivery_id,
+                    *filler_event_ids,
+                ]
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    oldest_item = _outbox_item(
+        oldest_delivery_id,
+        "task.reminder_due",
+        {
+            "task_id": "task-oldest",
+            "recipient_user_id": "user-123",
+            "message_context": {"pet_name": "Mochi", "plan_title": "care task"},
+        },
+    )
+    oldest_item["payload"]["event_id"] = oldest_business_event_id
+
+    current_item = _outbox_item(
+        current_delivery_id,
+        "task.reminder_due",
+        {
+            "task_id": "task-current",
+            "recipient_user_id": "user-123",
+            "message_context": {"pet_name": "Mochi", "plan_title": "care task"},
+        },
+    )
+    current_item["payload"]["event_id"] = current_business_event_id
+
+    client = FakeCoreClient(outbox_items=[current_item])
+    bridge = YouPetBridge(
+        _settings(user_chat_map={"user-123": "ww1234567890:zhangsan"}),
+        fake_send,
+    )
+    bridge._client = client
+
+    first_counts = await bridge.poll_once()
+
+    assert first_counts == _counts(pulled=1, processed=1, acked=1)
+    assert sent == []
+    assert len(bridge._processed_event_id_order) == MAX_PROCESSED_EVENT_IDS
+    assert bridge._processed_event_id_order == [
+        oldest_delivery_id,
+        current_business_event_id,
+        *filler_event_ids,
+    ]
+    assert oldest_delivery_id in bridge._processed_event_ids
+    assert current_delivery_id not in bridge._processed_event_ids
+    assert current_business_event_id in bridge._processed_event_ids
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    assert persisted["event_ids"] == bridge._processed_event_id_order
+
+    client.outbox_items = [oldest_item]
+    second_counts = await bridge.poll_once()
+
+    assert second_counts == _counts(pulled=1, processed=1, acked=1)
+    assert sent == []
+    ack_calls = [
+        call["url"]
+        for call in client.post_calls
+        if call["url"].endswith("/ack")
+    ]
+    assert ack_calls == [
+        "http://youpet-core.test/internal/events/outbox/02020202-0202-4202-8202-020202020202/ack",
+        "http://youpet-core.test/internal/events/outbox/01010101-0101-4101-8101-010101010101/ack",
+    ]
+    assert len(bridge._processed_event_id_order) == MAX_PROCESSED_EVENT_IDS
+    assert bridge._processed_event_id_order == [
+        oldest_business_event_id,
+        current_business_event_id,
+        *filler_event_ids,
+    ]
+    assert oldest_delivery_id not in bridge._processed_event_ids
+    assert current_delivery_id not in bridge._processed_event_ids
+    assert oldest_business_event_id in bridge._processed_event_ids
+    assert current_business_event_id in bridge._processed_event_ids
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    assert persisted["event_ids"] == bridge._processed_event_id_order
+
+
+def test_remember_processed_event_id_evicts_oldest_and_persists_bound():
+    bridge = YouPetBridge(_settings(), AsyncMock())
+
+    expected = [
+        f"event-{index:04d}"
+        for index in range(1, MAX_PROCESSED_EVENT_IDS + 1)
+    ]
+    for index in range(MAX_PROCESSED_EVENT_IDS + 1):
+        bridge._remember_processed_event_id(f"event-{index:04d}")
+
+    assert len(bridge._processed_event_id_order) == MAX_PROCESSED_EVENT_IDS
+    assert len(bridge._processed_event_ids) == MAX_PROCESSED_EVENT_IDS
+    assert bridge._processed_event_id_order == expected
+    assert "event-0000" not in bridge._processed_event_ids
+    assert expected[-1] in bridge._processed_event_ids
+    persisted = json.loads(
+        YouPetBridge._processed_event_state_path().read_text(encoding="utf-8")
+    )
+    assert persisted["event_ids"] == expected
+
+
+@pytest.mark.asyncio
+async def test_poll_once_replays_distinct_business_event_ids_when_row_shape_matches():
+    sent = []
+
+    async def fake_send(chat_id, content):
+        sent.append((chat_id, content))
+        return SendResult(success=True)
+
+    payload = {
+        "task_id": "task-6",
+        "recipient_user_id": "user-123",
+        "message_context": {"pet_name": "Mochi", "plan_title": "care task"},
+    }
+    first_item = _outbox_item(
+        "33333333-3333-4333-8333-333333333333",
+        "task.reminder_due",
+        payload,
+    )
+    first_item["payload"]["event_id"] = "business-task-6-a"
+    second_item = _outbox_item(
+        "44444444-4444-4444-8444-444444444444",
+        "task.reminder_due",
+        payload,
+    )
+    second_item["payload"]["event_id"] = "business-task-6-b"
+
+    client = FakeCoreClient(outbox_items=[first_item])
+    bridge = YouPetBridge(
+        _settings(user_chat_map={"user-123": "ww1234567890:zhangsan"}),
+        fake_send,
+    )
+    bridge._client = client
+
+    await bridge.poll_once()
+
+    client.outbox_items = [second_item]
+    await bridge.poll_once()
+
+    assert len(sent) == 2
+    ack_calls = [
+        call["url"]
+        for call in client.post_calls
+        if call["url"].endswith("/ack")
+    ]
+    assert ack_calls == [
+        "http://youpet-core.test/internal/events/outbox/33333333-3333-4333-8333-333333333333/ack",
+        "http://youpet-core.test/internal/events/outbox/44444444-4444-4444-8444-444444444444/ack",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_poll_once_nacks_supported_event_with_missing_business_event_id():
+    sent = []
+
+    async def fake_send(chat_id, content):
+        sent.append((chat_id, content))
+        return SendResult(success=True)
+
+    delivery_id = "55555555-5555-4555-8555-555555555555"
+    item = _outbox_item(
+        delivery_id,
+        "task.reminder_due",
+        {
+            "task_id": "task-7",
+            "recipient_user_id": "user-123",
+            "message_context": {"pet_name": "Mochi", "plan_title": "care task"},
+        },
+    )
+    item["payload"]["event_id"] = "   "
+
+    client = FakeCoreClient(outbox_items=[item])
+    bridge = YouPetBridge(
+        _settings(user_chat_map={"user-123": "ww1234567890:zhangsan"}),
+        fake_send,
+    )
+    bridge._client = client
+
+    counts = await bridge.poll_once()
+
+    assert counts == _counts(pulled=1, processed=1, nacked=1)
+    assert sent == []
+    assert client.post_calls[-1]["url"].endswith(f"/internal/events/outbox/{delivery_id}/nack")
+    assert client.post_calls[-1]["json"]["error"] == (
+        "Malformed YouPet task.reminder_due payload: missing event_id"
+    )
 
 
 @pytest.mark.asyncio

@@ -220,31 +220,37 @@ class YouPetBridge:
                     "[YouPetBridge] Skipping outbox item with missing event_id",
                 )
                 continue
-            event_id = str(item.get("event_id") or "").strip()
-            if not event_id:
+            delivery_id = str(item.get("event_id") or "").strip()
+            if not delivery_id:
                 counts["skipped"] += 1
                 logger.error(
                     "[YouPetBridge] Skipping outbox item with missing event_id",
                 )
                 continue
             try:
-                if event_id in self._processed_event_ids:
-                    await self._ack(event_id)
+                business_event_id = self._required_business_event_id(item)
+                legacy_processed = delivery_id in self._processed_event_ids
+                if business_event_id in self._processed_event_ids or legacy_processed:
+                    # Older ledgers persisted the outer delivery UUID; backfill the
+                    # inner business event ID so future writes stay canonical.
+                    if legacy_processed:
+                        self._replace_processed_event_id(delivery_id, business_event_id)
+                    await self._ack(delivery_id)
                     counts["acked"] += 1
                     continue
                 sent = await self._process_outbox_item(item)
                 if sent:
                     counts["sent"] += 1
-                self._remember_processed_event_id(event_id)
-                await self._ack(event_id)
+                self._remember_processed_event_id(business_event_id)
+                await self._ack(delivery_id)
                 counts["acked"] += 1
             except Exception as exc:
                 logger.warning(
                     "[YouPetBridge] Failed to process outbox event %s: %s",
-                    event_id,
+                    delivery_id,
                     exc,
                 )
-                await self._nack(event_id, str(exc))
+                await self._nack(delivery_id, str(exc))
                 counts["nacked"] += 1
         return counts
 
@@ -326,6 +332,27 @@ class YouPetBridge:
             return payload
         raise YouPetBridgeError(f"Malformed YouPet {event_type} payload")
 
+    @staticmethod
+    def _business_event_id(item: dict[str, Any]) -> str:
+        envelope = item.get("payload")
+        if not isinstance(envelope, dict):
+            return ""
+        event_id = envelope.get("event_id")
+        return str(event_id).strip() if isinstance(event_id, str) else ""
+
+    @staticmethod
+    def _required_business_event_id(item: dict[str, Any]) -> str:
+        event_type = str(item.get("event_type") or "")
+        envelope = item.get("payload")
+        if isinstance(envelope, dict) and not event_type:
+            event_type = str(envelope.get("event_type") or "")
+        if event_type not in SUPPORTED_OUTBOX_EVENTS:
+            return YouPetBridge._business_event_id(item)
+        event_id = YouPetBridge._business_event_id(item)
+        if event_id:
+            return event_id
+        raise YouPetBridgeError(f"Malformed YouPet {event_type} payload: missing event_id")
+
     def _load_processed_event_ids(self) -> list[str]:
         path = self._processed_event_state_path()
         try:
@@ -345,6 +372,41 @@ class YouPetBridge:
         if len(self._processed_event_id_order) > MAX_PROCESSED_EVENT_IDS:
             evicted = self._processed_event_id_order.pop(0)
             self._processed_event_ids.discard(evicted)
+        self._persist_processed_event_ids()
+
+    def _replace_processed_event_id(self, legacy_event_id: str, canonical_event_id: str) -> None:
+        if (
+            not legacy_event_id
+            or not canonical_event_id
+            or legacy_event_id == canonical_event_id
+            or legacy_event_id not in self._processed_event_ids
+        ):
+            return
+
+        canonical_present = canonical_event_id in self._processed_event_ids
+        replacement_written = False
+        next_event_ids: list[str] = []
+        for event_id in self._processed_event_id_order:
+            if event_id != legacy_event_id:
+                next_event_ids.append(event_id)
+                continue
+            if canonical_present:
+                continue
+            next_event_ids.append(canonical_event_id)
+            canonical_present = True
+            replacement_written = True
+
+        if replacement_written:
+            self._processed_event_id_order = next_event_ids
+        else:
+            self._processed_event_id_order = [
+                event_id for event_id in next_event_ids if event_id != legacy_event_id
+            ]
+        self._processed_event_ids = set(self._processed_event_id_order)
+
+        self._persist_processed_event_ids()
+
+    def _persist_processed_event_ids(self) -> None:
 
         path = self._processed_event_state_path()
         path.parent.mkdir(parents=True, exist_ok=True)
