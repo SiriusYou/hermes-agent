@@ -727,6 +727,90 @@ async def test_poll_once_dedupes_by_business_payload_event_id_when_row_ids_chang
 
 
 @pytest.mark.asyncio
+async def test_poll_once_recovers_after_transient_send_failure_without_duplicate_replay():
+    send_attempts = []
+    successful_sends = []
+    send_results = [
+        SendResult(success=False, error="transient send failure"),
+        SendResult(success=True),
+    ]
+
+    async def fake_send(chat_id, content):
+        send_attempts.append((chat_id, content))
+        result = send_results.pop(0)
+        if result.success:
+            successful_sends.append((chat_id, content))
+        return result
+
+    event_type = "task.reminder_due"
+    business_event_id = "business-task-recovery"
+    payload = {
+        "task_id": "task-recovery",
+        "recipient_user_id": "user-123",
+        "message_context": {"pet_name": "Mochi", "plan_title": "care task"},
+    }
+    first_item = _outbox_item(
+        "66666666-6666-4666-8666-666666666666",
+        event_type,
+        payload,
+    )
+    first_item["payload"]["event_id"] = business_event_id
+
+    second_item = _outbox_item(
+        "77777777-7777-4777-8777-777777777777",
+        event_type,
+        payload,
+    )
+    second_item["payload"]["event_id"] = business_event_id
+
+    replay_item = _outbox_item(
+        "88888888-8888-4888-8888-888888888888",
+        event_type,
+        payload,
+    )
+    replay_item["payload"]["event_id"] = business_event_id
+
+    client = FakeCoreClient(outbox_items=[first_item])
+    bridge = YouPetBridge(
+        _settings(user_chat_map={"user-123": "ww1234567890:zhangsan"}),
+        fake_send,
+    )
+    bridge._client = client
+
+    first_counts = await bridge.poll_once()
+
+    assert first_counts == _counts(pulled=1, processed=1, nacked=1)
+    assert client.post_calls[-1]["url"].endswith(
+        "/internal/events/outbox/66666666-6666-4666-8666-666666666666/nack"
+    )
+    assert business_event_id not in bridge._processed_event_ids
+    assert bridge._processed_event_id_order == []
+
+    client.outbox_items = [second_item]
+    second_counts = await bridge.poll_once()
+
+    assert second_counts == _counts(pulled=1, processed=1, sent=1, acked=1)
+    assert client.post_calls[-1]["url"].endswith(
+        "/internal/events/outbox/77777777-7777-4777-8777-777777777777/ack"
+    )
+    assert bridge._processed_event_id_order == [business_event_id]
+    assert business_event_id in bridge._processed_event_ids
+    assert "77777777-7777-4777-8777-777777777777" not in bridge._processed_event_ids
+
+    client.outbox_items = [replay_item]
+    replay_counts = await bridge.poll_once()
+
+    assert replay_counts == _counts(pulled=1, processed=1, acked=1)
+    assert client.post_calls[-1]["url"].endswith(
+        "/internal/events/outbox/88888888-8888-4888-8888-888888888888/ack"
+    )
+    assert len(send_attempts) == 2
+    assert len(successful_sends) == 1
+    assert bridge._processed_event_id_order == [business_event_id]
+    assert set(bridge._processed_event_ids) == {business_event_id}
+
+
+@pytest.mark.asyncio
 async def test_poll_once_dedupes_legacy_delivery_id_and_backfills_business_event_id():
     sent = []
 
