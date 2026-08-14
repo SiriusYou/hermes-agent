@@ -61,6 +61,7 @@ except ImportError:
 from gateway.config import Platform, PlatformConfig
 from gateway.integrations.youpet import YouPetBridge, YouPetBridgeError, youpet_settings_from_env
 from gateway.platforms.helpers import MessageDeduplicator
+from gateway.platforms.wecom_frame_capture import FrameCapture
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -177,6 +178,9 @@ class WeComAdapter(BasePlatformAdapter):
         self._dedup = MessageDeduplicator(max_size=DEDUP_MAX_SIZE)
         self._reply_req_ids: Dict[str, str] = {}
         self._youpet_bridge = self._build_youpet_bridge()
+        # F6.1 evidence hook: default-off unless YOUPET_WECOM_FRAME_CAPTURE_DIR
+        # names a validated owner-only directory. See wecom_frame_capture.py.
+        self._frame_capture = FrameCapture()
 
         # Text batching: merge rapid successive messages (Telegram-style).
         # WeCom clients split long messages around 4000 chars.
@@ -207,6 +211,16 @@ class WeComAdapter(BasePlatformAdapter):
             message = "WeCom startup failed: WECOM_BOT_ID and WECOM_SECRET are required"
             self._set_fatal_error("wecom_missing_credentials", message, retryable=True)
             logger.warning("[%s] %s", self.name, message)
+            return False
+        if self._frame_capture.requested and not self._frame_capture.enabled:
+            # Evidence capture was requested but the directory failed
+            # validation: refuse to run live traffic without it.
+            message = (
+                "WeCom startup failed: YOUPET_WECOM_FRAME_CAPTURE_DIR is set but the "
+                "capture directory failed validation"
+            )
+            self._set_fatal_error("wecom_frame_capture_dir_invalid", message, retryable=False)
+            logger.error("[%s] %s", self.name, message)
             return False
 
         try:
@@ -373,8 +387,11 @@ class WeComAdapter(BasePlatformAdapter):
             msg = await self._ws.receive()
             if msg.type == aiohttp.WSMsgType.TEXT:
                 payload = self._parse_json(msg.data)
-                if payload:
-                    await self._dispatch_payload(payload)
+                if payload is None:
+                    continue
+                if not self._capture_callback_frame(msg.data, payload):
+                    continue  # requested capture failed; never dispatch unrecorded callbacks
+                await self._dispatch_payload(payload)
             elif msg.type in {aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSING}:
                 raise RuntimeError("WeCom websocket closed")
 
@@ -397,6 +414,26 @@ class WeComAdapter(BasePlatformAdapter):
                     logger.debug("[%s] Heartbeat send failed: %s", self.name, exc)
         except asyncio.CancelledError:
             pass
+
+    def _capture_callback_frame(self, raw: Any, payload: Dict[str, Any]) -> bool:
+        """Capture-gate for inbound frames (F6.1 evidence).
+
+        Returns False only for callback frames whose requested capture did not
+        succeed; the caller must drop such frames instead of dispatching them
+        unrecorded. Non-callback frames (heartbeats, handshake, send-path
+        responses) and the default-off mode always return True, so the bot
+        secret and outbound content never reach the capture directory and the
+        unset case keeps zero behavior change. The raw ``msg.data`` is written
+        verbatim — never a re-serialized payload.
+        """
+        if str(payload.get("cmd") or "") not in CALLBACK_COMMANDS:
+            return True
+        if not self._frame_capture.requested:
+            return True
+        if self._frame_capture.capture(raw):
+            return True
+        logger.error("[%s] Callback dropped: capture-requested-but-failed", self.name)
+        return False
 
     async def _dispatch_payload(self, payload: Dict[str, Any]) -> None:
         """Route inbound websocket payloads."""
