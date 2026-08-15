@@ -181,6 +181,11 @@ class WeComAdapter(BasePlatformAdapter):
         # F6.1 evidence hook: default-off unless YOUPET_WECOM_FRAME_CAPTURE_DIR
         # names a validated owner-only directory. See wecom_frame_capture.py.
         self._frame_capture = FrameCapture()
+        # A1-07 evidence: env-gated whitelist audit log for event callbacks.
+        # Unset means zero logs and zero behavior change.
+        self._event_observe = os.getenv("YOUPET_WECOM_EVENT_OBSERVE", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
 
         # Text batching: merge rapid successive messages (Telegram-style).
         # WeCom clients split long messages around 4000 chars.
@@ -450,9 +455,46 @@ class WeComAdapter(BasePlatformAdapter):
             await self._on_message(payload)
             return
         if cmd in {APP_CMD_PING, APP_CMD_EVENT_CALLBACK}:
+            if cmd == APP_CMD_EVENT_CALLBACK:
+                self._observe_event_callback(payload)
             return
 
         logger.debug("[%s] Ignoring websocket payload: %s", self.name, cmd or payload)
+
+    @staticmethod
+    def _classify_event_callback(payload: Dict[str, Any]) -> str:
+        """Whitelist classification on the documented wire path only.
+
+        The official long-connection document fixes the discriminator at
+        ``body.event.eventtype`` with ``body.msgtype == "event"``. Anything
+        deviating from that shape — including lookalike ``type`` /
+        ``event_type`` fields at other levels — is classified ``other``.
+        """
+        body = payload.get("body")
+        if not isinstance(body, dict) or body.get("msgtype") != "event":
+            return "other"
+        event = body.get("event")
+        if not isinstance(event, dict):
+            return "other"
+        if event.get("eventtype") == "disconnected_event":
+            return "disconnected_event"
+        return "other"
+
+    def _observe_event_callback(self, payload: Dict[str, Any]) -> None:
+        """Env-gated whitelist audit log for event callbacks (A1-07 evidence).
+
+        Emits exactly one fixed-label line per event when
+        YOUPET_WECOM_EVENT_OBSERVE is enabled; unset means zero logs and zero
+        behavior change. Observation only — no dispatch, no Core bridge, no
+        reply. Never logs payloads, identifiers, URLs, reasons, or values.
+        """
+        if not self._event_observe:
+            return
+        logger.info(
+            "[%s] WeCom event callback observed: event_class=%s",
+            self.name,
+            self._classify_event_callback(payload),
+        )
 
     def _fail_pending_responses(self, exc: Exception) -> None:
         """Fail all outstanding request futures."""
