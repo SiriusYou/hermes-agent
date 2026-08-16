@@ -10,8 +10,12 @@ unknown-outcome state machine under emission/close fault injection.
 import asyncio
 import importlib.util
 import json
+import os
 import subprocess
+import sys
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -38,6 +42,9 @@ class FakeAdapter:
         self._pending_responses = {}
         self._on_message = None
         self._youpet_bridge = None
+        self._running = True
+        self._listen_task = None
+        self._ws = None
 
     def _is_group_allowed(self, chat_id, sender_id):
         return self.group_allowed
@@ -50,7 +57,12 @@ class FakeAdapter:
         return True
 
     async def disconnect(self):
-        return None
+        # Mirror the real adapter's full lifecycle: stop flag first, then
+        # listener quiescence, then the socket close and reference clearing.
+        self._running = False
+        self._listen_task = None
+        await self._cleanup_ws()
+        self._ws = None
 
     async def _dispatch_payload(self, payload):
         return None
@@ -407,10 +419,11 @@ class TestSendDisconnect:
 
     @pytest.mark.asyncio
     async def test_hanging_cleanup_is_bounded(self, monkeypatch):
-        """The peer never answering the close handshake must not hang the
-        driver after the outcome is already decided (live A2-03 hang). The
-        outer wait_for is the test's own watchdog: if the internal bound is
-        ever deleted, this test fails in ~1s instead of hanging CI ~999s."""
+        """A close handshake that never answers (but YIELDS) must map to
+        injection timeout, not hang the driver. The outer wait_for bounds
+        this yielding fake in ~1s if the internal bound is deleted. The
+        NO-YIELD starvation class cannot be tested in-process — see
+        TestDisconnectLifecycleSubprocess."""
         monkeypatch.setattr(driver, "CLEANUP_TIMEOUT_SECONDS", 0.1)
         adapter = FakeAdapter(response=None)
 
@@ -433,16 +446,56 @@ class TestSendDisconnect:
 
     @pytest.mark.asyncio
     async def test_close_returning_with_socket_still_set_is_unconfirmed(self):
-        """_cleanup_ws() returning is not enough: a socket reference that
-        survives cleanup means closure is unconfirmed — 'confirmed' requires
-        the adapter's _ws to be cleared, and the criterion must fail."""
+        """A disconnect lifecycle that RETURNS but leaves a socket reference
+        has not proven closure — confirmed requires _ws cleared."""
         adapter = FakeAdapter(response=None)
-        adapter._ws = object()  # leftover socket reference survives cleanup
+
+        async def leaky_disconnect():
+            adapter._running = False
+            adapter._listen_task = None
+            adapter._ws = object()  # socket reference survives the lifecycle
+
+        adapter.disconnect = leaky_disconnect
         result = await driver.attempt_send_disconnect(adapter, chat_id="t", content="hi")
         assert result["transport_outcome"] == "unknown"
         assert result["reason_class"] == "disconnect-injection-unconfirmed"
         assert result["disconnect_injection_outcome"] == "failed"
         assert adapter._pending_responses == {}
+        assert driver.evaluate_case("send-disconnect", result) == (False, False, True)
+
+    @pytest.mark.asyncio
+    async def test_disconnect_leaving_live_listen_task_is_unconfirmed(self):
+        """confirmed requires the listen task cancelled and awaited; a
+        lifecycle that leaves it referenced is a failed injection (the v2
+        spin entered through a listener that outlived the close)."""
+        adapter = FakeAdapter(response=None)
+
+        async def partial_disconnect():
+            adapter._running = False
+            adapter._listen_task = object()  # listener never actually stopped
+            adapter._ws = None
+
+        adapter.disconnect = partial_disconnect
+        result = await driver.attempt_send_disconnect(adapter, chat_id="t", content="hi")
+        assert result["transport_outcome"] == "unknown"
+        assert result["reason_class"] == "disconnect-injection-unconfirmed"
+        assert result["disconnect_injection_outcome"] == "failed"
+        assert driver.evaluate_case("send-disconnect", result) == (False, False, True)
+
+    @pytest.mark.asyncio
+    async def test_disconnect_leaving_running_set_is_unconfirmed(self):
+        """confirmed requires _running cleared — the listener's stop flag."""
+        adapter = FakeAdapter(response=None)
+
+        async def incomplete_disconnect():
+            adapter._listen_task = None
+            adapter._ws = None
+            # _running stays True: the listener was never told to stop
+
+        adapter.disconnect = incomplete_disconnect
+        result = await driver.attempt_send_disconnect(adapter, chat_id="t", content="hi")
+        assert result["disconnect_injection_outcome"] == "failed"
+        assert result["reason_class"] == "disconnect-injection-unconfirmed"
         assert driver.evaluate_case("send-disconnect", result) == (False, False, True)
 
     @pytest.mark.asyncio
@@ -843,3 +896,136 @@ class TestRunWiring:
         assert rc == 1
         assert out["exclusive_window_valid"] is False
         assert out["requires_rerun"] is True
+
+
+class TestReadEventsCloseSemantics:
+    """_read_events may return normally ONLY when the adapter is stopping.
+    Exiting the read loop while _running must raise into the caller's paced
+    reconnect path — the 2026-08-16 v2 100%-CPU spin entered through a
+    silent normal return that was re-awaited instantly without yielding."""
+
+    @staticmethod
+    def _real_adapter():
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(
+            PlatformConfig(enabled=True, extra={"bot_id": "s", "secret": "s"})
+        )
+        adapter._youpet_bridge = None
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_closed_socket_under_running_loop_raises(self):
+        adapter = self._real_adapter()
+        adapter._running = True
+        adapter._ws = SimpleNamespace(closed=True)  # closed under a running loop
+        with pytest.raises(RuntimeError, match="closed"):
+            await adapter._read_events()
+
+    @pytest.mark.asyncio
+    async def test_closed_socket_while_stopping_returns_quietly(self):
+        adapter = self._real_adapter()
+        adapter._running = False  # disconnect() path: normal return is correct
+        adapter._ws = SimpleNamespace(closed=True)
+        await adapter._read_events()  # must return, not raise
+
+
+SPIN_CHILD = Path(__file__).resolve().parent / "f61_a2_spin_child.py"
+
+
+def _spin_child_env(state_home: Path):
+    """Hermetic child env: no WeCom/YouPet/F61/Hermes settings leak in, and
+    the state root is redirected to a private tmp dir — never deleted, or
+    the adapter falls back to the operator's real ~/.hermes and the real
+    disconnect() writes gateway_state.json there."""
+    env = dict(os.environ)
+    for key in [k for k in env if k.startswith(("YOUPET_", "F61_", "WECOM_", "HERMES_"))]:
+        env.pop(key)
+    hermes_home = state_home / "hermes-home"
+    hermes_home.mkdir()
+    env["HERMES_HOME"] = str(hermes_home)
+    env["XDG_STATE_HOME"] = str(state_home / "xdg-state")
+    return env
+
+
+def _real_gateway_state_snapshot():
+    """Metadata of the operator's REAL gateway state file (None if absent);
+    the subprocess tests must never change it."""
+    path = Path.home() / ".hermes" / "gateway_state.json"
+    if not path.exists():
+        return None
+    stat = path.stat()
+    return (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+
+@pytest.mark.live_system_guard_bypass  # signals own child: real terminate/kill
+class TestDisconnectLifecycleSubprocess:
+    """The no-yield hot-loop failure class starves every same-loop watchdog
+    (asyncio.wait_for timeouts are event-loop callbacks and never fire;
+    live SIGINT was observed swallowed). These tests therefore run the REAL
+    adapter listen path in a child process under an OS-level deadline, with
+    forced cleanup after timeout."""
+
+    def test_disconnect_quiesces_listener_before_confirming(self, tmp_path):
+        """Full lifecycle: a parked REAL listen loop must be stopped by the
+        attempt, and confirmed requires listener quiescence + socket
+        cleared — not merely a returned cleanup call."""
+        state_before = _real_gateway_state_snapshot()
+        proc = subprocess.run(
+            [sys.executable, str(SPIN_CHILD), "driver-lifecycle"],
+            capture_output=True, text=True, timeout=30,
+            cwd=str(driver.REPO_ROOT), env=_spin_child_env(tmp_path),
+        )
+        assert _real_gateway_state_snapshot() == state_before
+        # The write path is genuinely exercised AND redirected: the real
+        # disconnect() lands gateway_state.json in the private HERMES_HOME,
+        # never in the operator's ~/.hermes.
+        assert (tmp_path / "hermes-home" / "gateway_state.json").exists()
+        assert proc.returncode == 0, proc.stderr[-2000:]
+        report = json.loads(proc.stdout.strip().splitlines()[-1])
+        result = report["result"]
+        assert result["transport_outcome"] == "unknown"
+        assert result["reason_class"] == "disconnected-before-response"
+        assert result["disconnect_injection_outcome"] == "confirmed"
+        assert report["receive_entered"] is True  # listener was really parked
+        assert report["listen_task_is_none"] is True
+        assert report["ws_is_none"] is True
+        assert report["running"] is False
+        assert report["session_is_none"] is True
+        assert report["heartbeat_task_is_none"] is True
+        assert report["pending_empty"] is True
+
+    def test_listen_loop_paces_reconnect_when_socket_closed_under_it(self, tmp_path):
+        """A socket closed under a running listen loop must take the paced
+        reconnect path (observable log cadence within backoff bounds),
+        never a silent no-yield spin or an unbounded fast loop. The parent
+        bounds the child with an OS-level deadline plus SIGTERM/SIGKILL,
+        and every exit path reaps the child."""
+        state_before = _real_gateway_state_snapshot()
+        proc = subprocess.Popen(
+            [sys.executable, str(SPIN_CHILD), "listen-spin"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            cwd=str(driver.REPO_ROOT), env=_spin_child_env(tmp_path),
+        )
+        try:
+            deadline = time.monotonic() + 6
+            while time.monotonic() < deadline and proc.poll() is None:
+                time.sleep(0.2)
+        finally:
+            if proc.poll() is None:
+                proc.terminate()  # SIGTERM: OS-level, lands on a starved loop
+            try:
+                _out, err = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                _out, err = proc.communicate()
+        assert _real_gateway_state_snapshot() == state_before
+        errors = err.count("WebSocket error")
+        reconnects = err.count("Reconnect failed")
+        # Backoff is 2s then 5s, so the paced path logs exactly 2 error
+        # passes + 1 failed reopen inside 6s. Bounds kill both mutations:
+        # the silent no-yield spin (0 lines) and a backoff-deleted fast
+        # loop (hundreds of lines).
+        assert 2 <= errors <= 4, f"unpaced or silent loop: {err[-1000:]}"
+        assert 1 <= reconnects <= 2, f"unexpected reopen cadence: {err[-1000:]}"

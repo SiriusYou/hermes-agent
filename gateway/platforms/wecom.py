@@ -399,6 +399,14 @@ class WeComAdapter(BasePlatformAdapter):
                 await self._dispatch_payload(payload)
             elif msg.type in {aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSING}:
                 raise RuntimeError("WeCom websocket closed")
+        if self._running:
+            # The read loop exited while still running: the socket was
+            # closed under us (e.g. a concurrent cleanup). Treat it exactly
+            # like an observed close so the caller's paced reconnect path
+            # runs — a silent normal return would be re-awaited instantly
+            # and may never yield to the event loop (2026-08-16 live
+            # 100%-CPU spin during the F6.1 A2-03 v2 run).
+            raise RuntimeError("WeCom websocket closed")
 
     async def _heartbeat_loop(self) -> None:
         """Send lightweight application-level pings."""

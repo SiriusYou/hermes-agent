@@ -42,10 +42,13 @@ Subcommands:
   send-disconnect      emit aibot_send_msg, then close the socket with the
                        response future unresolved; outcome "unknown" unless a
                        trusted response demonstrably arrived first (A2-03).
-                       The criterion passes only on a confirmed close
-                       (disconnect_injection_outcome "confirmed"); a close
-                       timeout/failure is "disconnect-injection-unconfirmed"
-                       and forces a rerun
+                       The criterion passes only on a confirmed close: the
+                       FULL adapter disconnect lifecycle (running flag
+                       cleared, listen task cancelled and awaited, socket
+                       closed and dereferenced) inside the bounded window.
+                       A timeout/failure or a lifecycle that leaves the
+                       listener or socket referenced is
+                       "disconnect-injection-unconfirmed" and forces a rerun
   recall-capability    OFFLINE: pinned adapter command inventory vs the
                        documented command set; never connects (A2-05)
 """
@@ -368,12 +371,20 @@ async def attempt_send_disconnect(adapter, *, chat_id, content):
         future.cancel()
     adapter._pending_responses.pop(req_id, None)
     # A2-03 has two independent axes: no correlated response arrived
-    # (transport) AND the disconnect actually happened (injection). Only a
-    # cleanup that returns AND leaves no socket reference proves the second;
-    # a close timeout/failure is an unconfirmed injection, never evidence.
+    # (transport) AND the disconnect actually happened (injection). Only the
+    # FULL disconnect lifecycle counts as a confirmed injection — _running
+    # cleared, the listen task cancelled and awaited, the socket closed and
+    # dereferenced. A bare _cleanup_ws() races the live listen loop: the
+    # 2026-08-16 v2 run spun at 100% CPU and starved every in-process
+    # timeout.
     try:
-        await asyncio.wait_for(adapter._cleanup_ws(), timeout=CLEANUP_TIMEOUT_SECONDS)
-        injection = "confirmed" if getattr(adapter, "_ws", None) is None else "failed"
+        await asyncio.wait_for(adapter.disconnect(), timeout=CLEANUP_TIMEOUT_SECONDS)
+        quiesced = (
+            not getattr(adapter, "_running", True)
+            and getattr(adapter, "_listen_task", None) is None
+            and getattr(adapter, "_ws", None) is None
+        )
+        injection = "confirmed" if quiesced else "failed"
     except asyncio.TimeoutError:
         injection = "timeout"
     except Exception:
