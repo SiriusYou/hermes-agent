@@ -373,6 +373,7 @@ class TestSendDisconnect:
         assert result["emitted"] is True
         assert result["transport_outcome"] == "unknown"
         assert result["reason_class"] == "disconnected-before-response"
+        assert result["disconnect_injection_outcome"] == "confirmed"
         assert adapter.closed is True
         assert adapter._pending_responses == {}
 
@@ -393,10 +394,56 @@ class TestSendDisconnect:
 
     @pytest.mark.asyncio
     async def test_cleanup_failure_is_contained(self):
+        """A failed close handshake must NOT read as 'disconnected before
+        response': the injection outcome is failed and the criterion fails."""
         adapter = FakeAdapter(response=None)
         adapter.cleanup_fails = True
         result = await driver.attempt_send_disconnect(adapter, chat_id="t", content="hi")
         assert result["transport_outcome"] == "unknown"
+        assert result["reason_class"] == "disconnect-injection-unconfirmed"
+        assert result["disconnect_injection_outcome"] == "failed"
+        assert adapter._pending_responses == {}
+        assert driver.evaluate_case("send-disconnect", result) == (False, False, True)
+
+    @pytest.mark.asyncio
+    async def test_hanging_cleanup_is_bounded(self, monkeypatch):
+        """The peer never answering the close handshake must not hang the
+        driver after the outcome is already decided (live A2-03 hang). The
+        outer wait_for is the test's own watchdog: if the internal bound is
+        ever deleted, this test fails in ~1s instead of hanging CI ~999s."""
+        monkeypatch.setattr(driver, "CLEANUP_TIMEOUT_SECONDS", 0.1)
+        adapter = FakeAdapter(response=None)
+
+        async def hanging_cleanup():
+            await asyncio.sleep(999)
+
+        adapter._cleanup_ws = hanging_cleanup
+        start = asyncio.get_running_loop().time()
+        result = await asyncio.wait_for(
+            driver.attempt_send_disconnect(adapter, chat_id="t", content="hi"),
+            timeout=1.0,
+        )
+        elapsed = asyncio.get_running_loop().time() - start
+        assert result["transport_outcome"] == "unknown"
+        assert result["reason_class"] == "disconnect-injection-unconfirmed"
+        assert result["disconnect_injection_outcome"] == "timeout"
+        assert adapter._pending_responses == {}
+        assert driver.evaluate_case("send-disconnect", result) == (False, False, True)
+        assert elapsed < 5  # bounded by the 0.1s test timeout, not 999s
+
+    @pytest.mark.asyncio
+    async def test_close_returning_with_socket_still_set_is_unconfirmed(self):
+        """_cleanup_ws() returning is not enough: a socket reference that
+        survives cleanup means closure is unconfirmed — 'confirmed' requires
+        the adapter's _ws to be cleared, and the criterion must fail."""
+        adapter = FakeAdapter(response=None)
+        adapter._ws = object()  # leftover socket reference survives cleanup
+        result = await driver.attempt_send_disconnect(adapter, chat_id="t", content="hi")
+        assert result["transport_outcome"] == "unknown"
+        assert result["reason_class"] == "disconnect-injection-unconfirmed"
+        assert result["disconnect_injection_outcome"] == "failed"
+        assert adapter._pending_responses == {}
+        assert driver.evaluate_case("send-disconnect", result) == (False, False, True)
 
     @pytest.mark.asyncio
     async def test_exceptional_completion_is_not_mistaken_for_response(self):
@@ -555,7 +602,13 @@ class TestCaseCriteriaMatrix:
             ("send-invalid", {"transport_outcome": "rejected_by_platform", "errmsg_class": "rate-limit"}, (True, False, False)),
             ("send-invalid", {"transport_outcome": "accepted_by_platform"}, (True, False, False)),
             ("send-invalid", {"transport_outcome": "unknown"}, (False, False, True)),
-            ("send-disconnect", {"transport_outcome": "unknown", "reason_class": "disconnected-before-response"}, (True, True, False)),
+            ("send-disconnect", {"transport_outcome": "unknown", "reason_class": "disconnected-before-response", "disconnect_injection_outcome": "confirmed"}, (True, True, False)),
+            # The gate must CONSUME the injection field: a contradictory
+            # record (close failed yet reason claims disconnection) and a
+            # record missing the field entirely both require a rerun.
+            ("send-disconnect", {"transport_outcome": "unknown", "reason_class": "disconnected-before-response", "disconnect_injection_outcome": "failed"}, (False, False, True)),
+            ("send-disconnect", {"transport_outcome": "unknown", "reason_class": "disconnected-before-response"}, (False, False, True)),
+            ("send-disconnect", {"transport_outcome": "unknown", "reason_class": "disconnect-injection-unconfirmed"}, (False, False, True)),
             ("send-disconnect", {"transport_outcome": "accepted_by_platform", "note": "response-completed-before-disconnect"}, (True, False, True)),
             ("send-disconnect", {"transport_outcome": "unknown", "reason_class": "emission-failed"}, (False, False, True)),
             ("connect-check", {"transport_outcome": "connected"}, (True, True, False)),
@@ -726,6 +779,30 @@ class TestRunWiring:
         assert rc == 1
         assert out["exclusive_window_valid"] is False
         assert out["requires_rerun"] is True
+
+    @pytest.mark.asyncio
+    async def test_hanging_disconnect_still_prints_record(self, monkeypatch, capsys):
+        """run() must emit the record even if adapter.disconnect() hangs."""
+        monkeypatch.setattr(driver, "CLEANUP_TIMEOUT_SECONDS", 0.1)
+        adapter = FakeAdapter(response=good_response())
+
+        async def hanging_disconnect():
+            await asyncio.sleep(999)
+
+        adapter.disconnect = hanging_disconnect
+        monkeypatch.setattr(driver, "build_adapter", lambda: adapter)
+        import types
+        args = types.SimpleNamespace(
+            case="send-dm", marker=MARKER, reply="", delivery_alias="d", attempt=1,
+        )
+        monkeypatch.setenv("F61_A2_DM_TARGET", "operator-alias-target")
+        # Outer watchdog: if the bounded final cleanup is ever unbounded,
+        # this test fails in ~1s instead of hanging CI ~999s.
+        rc = await asyncio.wait_for(driver.run(args), timeout=1.0)
+        out = json.loads(capsys.readouterr().out)
+        assert rc == 0
+        assert out["transport_outcome"] == "accepted_by_platform"
+        assert adapter._pending_responses == {}
 
     @pytest.mark.asyncio
     async def test_benign_event_does_not_fail_the_run(self, monkeypatch, capsys):

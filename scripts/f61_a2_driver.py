@@ -41,7 +41,11 @@ Subcommands:
                        target; never retried (A2-02)
   send-disconnect      emit aibot_send_msg, then close the socket with the
                        response future unresolved; outcome "unknown" unless a
-                       trusted response demonstrably arrived first (A2-03)
+                       trusted response demonstrably arrived first (A2-03).
+                       The criterion passes only on a confirmed close
+                       (disconnect_injection_outcome "confirmed"); a close
+                       timeout/failure is "disconnect-injection-unconfirmed"
+                       and forces a rerun
   recall-capability    OFFLINE: pinned adapter command inventory vs the
                        documented command set; never connects (A2-05)
 """
@@ -58,6 +62,7 @@ from pathlib import Path
 INVALID_TARGET = "f61-invalid-target-0000"  # deliberately non-routable (A2-02)
 MAX_CONTENT = 4000
 REQUEST_TIMEOUT_SECONDS = 15.0
+CLEANUP_TIMEOUT_SECONDS = 5.0  # bound all close/disconnect handshakes
 HERE = Path(__file__).resolve()
 REPO_ROOT = HERE.parents[1]
 DRIVER_REL = "scripts/f61_a2_driver.py"
@@ -356,15 +361,28 @@ async def attempt_send_disconnect(adapter, *, chat_id, content):
         result["note"] = "response-completed-before-disconnect"
         return result
     # Unresolved: remove from the pending map FIRST so the close cannot
-    # complete it exceptionally, then disconnect and record unknown.
+    # complete it exceptionally, then disconnect and record unknown. The
+    # close handshake is bounded: a peer that never answers must not hang
+    # the driver after the outcome is already decided.
     if not future.done():
         future.cancel()
     adapter._pending_responses.pop(req_id, None)
+    # A2-03 has two independent axes: no correlated response arrived
+    # (transport) AND the disconnect actually happened (injection). Only a
+    # cleanup that returns AND leaves no socket reference proves the second;
+    # a close timeout/failure is an unconfirmed injection, never evidence.
     try:
-        await adapter._cleanup_ws()
+        await asyncio.wait_for(adapter._cleanup_ws(), timeout=CLEANUP_TIMEOUT_SECONDS)
+        injection = "confirmed" if getattr(adapter, "_ws", None) is None else "failed"
+    except asyncio.TimeoutError:
+        injection = "timeout"
     except Exception:
-        pass  # close failure is contained; the outcome is already unknown
-    result = _unknown("disconnected-before-response", req_id)
+        injection = "failed"
+    if injection == "confirmed":
+        result = _unknown("disconnected-before-response", req_id)
+    else:
+        result = _unknown("disconnect-injection-unconfirmed", req_id)
+    result["disconnect_injection_outcome"] = injection
     result["emitted"] = True
     result["emitted_ms"] = emitted_ms
     return result
@@ -478,8 +496,16 @@ def evaluate_case(case, result):
         criterion = outcome == "connected"
         return True, criterion, not criterion
     if case == "send-disconnect":
-        if outcome == "unknown" and result.get("reason_class") == "disconnected-before-response":
+        # The certification gate CONSUMES the injection field: all three
+        # conjuncts must hold — a contradictory or incomplete record reruns.
+        if (
+            outcome == "unknown"
+            and result.get("reason_class") == "disconnected-before-response"
+            and result.get("disconnect_injection_outcome") == "confirmed"
+        ):
             return True, True, False  # the target state was demonstrated
+        if result.get("reason_class") == "disconnect-injection-unconfirmed":
+            return False, False, True  # close unconfirmed; the run proves nothing
         if result.get("note") == "response-completed-before-disconnect":
             return True, False, True  # window missed; rerun required
         return False, False, True     # emission failed etc.
@@ -588,10 +614,13 @@ async def run(args) -> int:
         result["observation_complete"] = complete
         result["case_criterion_met"] = criterion
         result["requires_rerun"] = rerun or window_invalid
-        print(json.dumps(result, sort_keys=True))
+        print(json.dumps(result, sort_keys=True), flush=True)
         return 0 if (criterion and not window_invalid) else 1
     finally:
-        await adapter.disconnect()
+        try:
+            await asyncio.wait_for(adapter.disconnect(), timeout=CLEANUP_TIMEOUT_SECONDS)
+        except Exception:
+            pass  # a hanging shutdown must not suppress the printed record
 
 
 def main_for(argv) -> int:
