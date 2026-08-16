@@ -8,9 +8,10 @@ reconnects mid-run, and never degrades or falls back on its own.
 
 Inbound safety: every mode installs a drop-only inbound guard before
 connecting; the group-reply mode swaps in a restricted observer that applies
-the configured group/sender policy and binds only an exact, mention-stripped
-marker match (first match wins). No mode dispatches, bridges Core, or
-replies on its own. Retained external fields are mapped to closed enums.
+the configured group/sender policy and binds only on full-text equality with
+the approved ``<mention-prefix> <marker>`` (first match wins). No mode
+dispatches, bridges Core, or replies on its own. Retained external fields
+are mapped to closed enums.
 
 Outcome contract (three states):
   accepted_by_platform — explicit integer errcode == 0 on a response
@@ -20,7 +21,8 @@ Outcome contract (three states):
                          missing/malformed fields, or an uncorrelated
                          response
 
-Every record carries exclusive_window_valid (no takeover events observed),
+Every record carries exclusive_window_valid (no invalidating event classes
+observed — the documented benign enter_chat does not invalidate),
 observation_complete, case_criterion_met, and requires_rerun.
 
 Credentials come from the launching shell (set -a; source ~/.hermes/.env).
@@ -32,7 +34,8 @@ Subcommands:
   connect-check        connect, hold briefly, report takeover events
   send-dm              one aibot_send_msg to $F61_A2_DM_TARGET (A2-01 DM leg)
   send-group-reply     aibot_respond_msg once, bound to an inbound req_id
-                       captured on THIS connection via exact marker match
+                       captured on THIS connection by full-text equality
+                       with the approved '<mention-prefix> <marker>'
                        (A2-01 group leg)
   send-invalid         one aibot_send_msg to a deliberately invalid synthetic
                        target; never retried (A2-02)
@@ -47,7 +50,6 @@ import argparse
 import asyncio
 import json
 import os
-import re
 import subprocess
 import sys
 import time
@@ -365,11 +367,13 @@ async def attempt_send_disconnect(adapter, *, chat_id, content):
     return result
 
 
-async def attempt_group_reply(adapter, *, marker, reply, inbox, timeout_s=120):
+async def attempt_group_reply(adapter, *, marker, reply, mention_prefix, inbox, timeout_s=120):
     """Reply once via aibot_respond_msg, bound to an inbound req_id captured
-    on THIS connection by an exact, mention-stripped marker match that also
-    passes the configured group/sender policy. First match wins; malformed
-    frames are ignored. No send otherwise — no proactive group send."""
+    on THIS connection by full-text equality with the operator-approved
+    ``<mention_prefix> <marker>`` string (after policy checks). First match
+    wins; malformed frames are ignored. No send otherwise — no proactive
+    group send."""
+    expected_text = f"{mention_prefix.strip()} {marker}"
     got = {}
     done = asyncio.Event()
 
@@ -387,9 +391,8 @@ async def attempt_group_reply(adapter, *, marker, reply, inbox, timeout_s=120):
         sender_id = str(body["from"].get("userid") or "").strip()
         if not adapter._is_group_allowed(chat_id, sender_id):
             return
-        text = str(body["text"].get("content") or "")
-        normalized = re.sub(r"^@\S+\s*", "", text).strip()
-        if normalized == marker:
+        text = str(body["text"].get("content") or "").rstrip()
+        if text == expected_text:
             got["req_id"] = headers.get("req_id")
             got["msgid_len"] = len(str(body.get("msgid") or ""))
             done.set()
@@ -523,6 +526,10 @@ def offline_preflight(args) -> int:
         if len(args.reply) > MAX_CONTENT:
             print("--reply exceeds the transport limit; refusing to truncate", file=sys.stderr)
             return 2
+        if not args.mention_prefix.strip().startswith("@"):
+            print("--mention-prefix must be the operator-approved mention (e.g. '@Agent Core Bot')",
+                  file=sys.stderr)
+            return 2
     return 0
 
 
@@ -549,7 +556,8 @@ async def run(args) -> int:
             )
         elif args.case == "send-group-reply":
             result = await attempt_group_reply(
-                adapter, marker=args.marker.strip(), reply=args.reply.strip(), inbox=inbox
+                adapter, marker=args.marker.strip(), reply=args.reply.strip(),
+                mention_prefix=args.mention_prefix, inbox=inbox,
             )
         elif args.case == "send-invalid":
             result = await attempt_send(
@@ -567,15 +575,18 @@ async def run(args) -> int:
         result["case"] = args.case
         result["delivery_id_alias"] = args.delivery_alias
         result["attempt"] = args.attempt
-        result["takeover_events"] = takeover_events
+        result["observed_event_classes"] = takeover_events
         result["inbound_seen"] = inbox
+        # Only the documented benign event (enter_chat) keeps the window
+        # valid; disconnected_event and any unclassified "other" fail closed.
+        window_invalid = any(e != "enter_chat" for e in takeover_events)
         complete, criterion, rerun = evaluate_case(args.case, result)
-        result["exclusive_window_valid"] = not takeover_events
+        result["exclusive_window_valid"] = not window_invalid
         result["observation_complete"] = complete
         result["case_criterion_met"] = criterion
-        result["requires_rerun"] = rerun or bool(takeover_events)
+        result["requires_rerun"] = rerun or window_invalid
         print(json.dumps(result, sort_keys=True))
-        return 0 if (criterion and not takeover_events) else 1
+        return 0 if (criterion and not window_invalid) else 1
     finally:
         await adapter.disconnect()
 
@@ -588,6 +599,8 @@ def main_for(argv) -> int:
     ])
     parser.add_argument("--marker", default="", help="exact approved synthetic marker")
     parser.add_argument("--reply", default="", help="approved reply marker (group leg)")
+    parser.add_argument("--mention-prefix", default="",
+                        help="operator-approved mention prefix for the group leg, e.g. '@Agent Core Bot'")
     parser.add_argument("--delivery-alias", default="absent",
                         help="correlation alias only; the real delivery_id stays in Core")
     parser.add_argument("--attempt", type=int, default=1)

@@ -73,6 +73,23 @@ class TestDisconnectedEvent:
         assert caplog.text.count("event_class=disconnected_event") == 1
         assert CANARY not in caplog.text
 
+    @pytest.mark.asyncio
+    async def test_enter_chat_official_shape_gets_own_label(self, monkeypatch, caplog):
+        monkeypatch.setenv(OBSERVE_ENV_VAR, "1")
+        adapter = _adapter()
+        payload = {
+            "cmd": "aibot_event_callback",
+            "body": {
+                "msgid": CANARY,
+                "msgtype": "event",
+                "event": {"eventtype": "enter_chat"},
+            },
+        }
+        with caplog.at_level(logging.INFO):
+            await adapter._dispatch_payload(payload)
+        assert caplog.text.count("event_class=enter_chat") == 1
+        assert CANARY not in caplog.text
+
 
 class TestFalsePositiveGuards:
     @pytest.mark.asyncio

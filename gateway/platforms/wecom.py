@@ -478,6 +478,8 @@ class WeComAdapter(BasePlatformAdapter):
             return "other"
         if event.get("eventtype") == "disconnected_event":
             return "disconnected_event"
+        if event.get("eventtype") == "enter_chat":
+            return "enter_chat"
         return "other"
 
     def _observe_event_callback(self, payload: Dict[str, Any]) -> None:

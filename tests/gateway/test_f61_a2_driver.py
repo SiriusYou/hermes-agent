@@ -18,6 +18,7 @@ import pytest
 CANARY = "CANARY-SECRET-MARKER-4e91"
 MARKER = "WECOM-LC-20260815-01-A201-GROUP-PROBE"
 REPLY = "WECOM-LC-20260815-01-A201-GROUP-REPLY ack"
+MENTION = "@Agent Core Bot"
 
 DRIVER_PATH = Path(__file__).resolve().parents[2] / "scripts" / "f61_a2_driver.py"
 _spec = importlib.util.spec_from_file_location("f61_a2_driver", DRIVER_PATH)
@@ -184,7 +185,8 @@ class TestGroupReply:
     async def test_aborts_without_marker_and_never_falls_back(self):
         adapter = FakeAdapter()
         result = await driver.attempt_group_reply(
-            adapter, marker=MARKER, reply=REPLY, inbox=[], timeout_s=0.2
+            adapter, marker=MARKER, reply=REPLY, mention_prefix=MENTION,
+            inbox=[], timeout_s=0.2,
         )
         assert result["transport_outcome"] == "aborted"
         assert result["sent"] is False
@@ -205,7 +207,8 @@ class TestGroupReply:
 
         feeder = asyncio.create_task(feed_superstring())
         result = await driver.attempt_group_reply(
-            adapter, marker=MARKER, reply=REPLY, inbox=[], timeout_s=0.3
+            adapter, marker=MARKER, reply=REPLY, mention_prefix=MENTION,
+            inbox=[], timeout_s=0.3,
         )
         await feeder
         assert result["transport_outcome"] == "aborted"
@@ -220,13 +223,15 @@ class TestGroupReply:
             await adapter._on_message(
                 {"cmd": "aibot_msg_callback",
                  "body": {"chattype": "group", "msgid": "m" * 32, "chatid": "g",
-                          "from": {"userid": "u"}, "text": {"content": MARKER}},
+                          "from": {"userid": "u"},
+                          "text": {"content": f"{MENTION} {MARKER}"}},
                  "headers": {"req_id": "q" * 24}}
             )
 
         feeder = asyncio.create_task(feed_marker())
         result = await driver.attempt_group_reply(
-            adapter, marker=MARKER, reply=REPLY, inbox=[], timeout_s=0.3
+            adapter, marker=MARKER, reply=REPLY, mention_prefix=MENTION,
+            inbox=[], timeout_s=0.3,
         )
         await feeder
         assert result["transport_outcome"] == "aborted"
@@ -246,7 +251,8 @@ class TestGroupReply:
 
         feeder = asyncio.create_task(feed_malformed())
         result = await driver.attempt_group_reply(
-            adapter, marker=MARKER, reply=REPLY, inbox=[], timeout_s=0.3
+            adapter, marker=MARKER, reply=REPLY, mention_prefix=MENTION,
+            inbox=[], timeout_s=0.3,
         )
         await feeder
         assert result["transport_outcome"] == "aborted"
@@ -263,18 +269,100 @@ class TestGroupReply:
                 await adapter._on_message(
                     {"cmd": "aibot_msg_callback",
                      "body": {"chattype": "group", "msgid": "m" * 32, "chatid": "g",
-                              "from": {"userid": "u"}, "text": {"content": MARKER}},
+                              "from": {"userid": "u"},
+                              "text": {"content": f"@Agent Core Bot {MARKER}"}},
                      "headers": {"req_id": req}}
                 )
                 order.append(req)
 
         feeder = asyncio.create_task(feed_two())
         result = await driver.attempt_group_reply(
-            adapter, marker=MARKER, reply=REPLY, inbox=[], timeout_s=2
+            adapter, marker=MARKER, reply=REPLY, mention_prefix=MENTION,
+            inbox=[], timeout_s=2,
         )
         await feeder
         assert result["sent"] is True
         assert adapter.sent[0]["headers"]["req_id"] == "first-req-0000000000000000"
+
+    @pytest.mark.asyncio
+    async def test_multi_word_mention_binds_with_req_id_equality(self):
+        """Bot display names may contain spaces: '@Agent Core Bot MARKER'."""
+        adapter = FakeAdapter(response=good_response(req_id="q" * 24))
+
+        async def feed_marker():
+            await asyncio.sleep(0.05)
+            await adapter._on_message(
+                {"cmd": "aibot_msg_callback",
+                 "body": {"chattype": "group", "msgid": "m" * 32, "chatid": "g",
+                          "from": {"userid": "u"},
+                          "text": {"content": f"@Agent Core Bot {MARKER}"}},
+                 "headers": {"req_id": "q" * 24}}
+            )
+
+        feeder = asyncio.create_task(feed_marker())
+        result = await driver.attempt_group_reply(
+            adapter, marker=MARKER, reply=REPLY, mention_prefix=MENTION,
+            inbox=[], timeout_s=2,
+        )
+        await feeder
+        assert result["sent"] is True
+        assert result["transport_outcome"] == "accepted_by_platform"
+        assert adapter.sent[0]["cmd"] == "aibot_respond_msg"
+        assert adapter.sent[0]["headers"]["req_id"] == "q" * 24
+
+    @pytest.mark.asyncio
+    async def test_bare_marker_without_mention_never_binds(self):
+        adapter = FakeAdapter()
+
+        async def feed_bare():
+            await asyncio.sleep(0.05)
+            await adapter._on_message(
+                {"cmd": "aibot_msg_callback",
+                 "body": {"chattype": "group", "msgid": "m" * 32, "chatid": "g",
+                          "from": {"userid": "u"}, "text": {"content": MARKER}},
+                 "headers": {"req_id": "q" * 24}}
+            )
+
+        feeder = asyncio.create_task(feed_bare())
+        result = await driver.attempt_group_reply(
+            adapter, marker=MARKER, reply=REPLY, mention_prefix=MENTION,
+            inbox=[], timeout_s=0.3,
+        )
+        await feeder
+        assert result["transport_outcome"] == "aborted"
+        assert adapter.sent == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "wire_text",
+        [
+            f"@Someone Else {MARKER}",              # wrong mention
+            f"{MENTION} unrelated prose {MARKER}",  # prose between mention and marker
+            f"{MENTION} {MARKER} {MARKER}",         # doubled marker
+            f"{MENTION}{MARKER}",                   # missing separator
+            f"{MENTION} {MARKER} EXTRA",            # trailing prose
+        ],
+    )
+    async def test_near_miss_texts_never_bind(self, wire_text):
+        adapter = FakeAdapter()
+
+        async def feed():
+            await asyncio.sleep(0.05)
+            await adapter._on_message(
+                {"cmd": "aibot_msg_callback",
+                 "body": {"chattype": "group", "msgid": "m" * 32, "chatid": "g",
+                          "from": {"userid": "u"}, "text": {"content": wire_text}},
+                 "headers": {"req_id": "q" * 24}}
+            )
+
+        feeder = asyncio.create_task(feed())
+        result = await driver.attempt_group_reply(
+            adapter, marker=MARKER, reply=REPLY, mention_prefix=MENTION,
+            inbox=[], timeout_s=0.3,
+        )
+        await feeder
+        assert result["transport_outcome"] == "aborted"
+        assert adapter.sent == []
 
 
 class TestSendDisconnect:
@@ -356,6 +444,29 @@ class TestOfflinePreflight:
             lambda: (_ for _ in ()).throw(AssertionError("must not connect")),
         )
         assert driver.main_for(["send-group-reply", "--marker", "", "--reply", REPLY]) == 2
+
+    def test_missing_mention_prefix_rejected_before_connect(self, monkeypatch):
+        monkeypatch.setattr(driver, "verify_committed_self", lambda *a, **k: "")
+        monkeypatch.setattr(
+            driver, "build_adapter",
+            lambda: (_ for _ in ()).throw(AssertionError("must not connect")),
+        )
+        assert driver.main_for([
+            "send-group-reply", "--marker", MARKER, "--reply", REPLY,
+            "--delivery-alias", "delivery-02", "--attempt", "1",
+        ]) == 2
+
+    def test_malformed_mention_prefix_rejected_before_connect(self, monkeypatch):
+        monkeypatch.setattr(driver, "verify_committed_self", lambda *a, **k: "")
+        monkeypatch.setattr(
+            driver, "build_adapter",
+            lambda: (_ for _ in ()).throw(AssertionError("must not connect")),
+        )
+        assert driver.main_for([
+            "send-group-reply", "--marker", MARKER, "--reply", REPLY,
+            "--mention-prefix", "Agent Core Bot",  # no leading @
+            "--delivery-alias", "delivery-02", "--attempt", "1",
+        ]) == 2
 
     def test_missing_dm_target_rejected_before_connect(self, monkeypatch):
         monkeypatch.setattr(driver, "verify_committed_self", lambda *a, **k: "")
@@ -589,6 +700,46 @@ class TestRunWiring:
 
         monkeypatch.setattr(driver, "build_adapter", lambda: adapter)
         monkeypatch.setattr(driver, "install_event_spy", fake_spy)
+        import types
+        args = types.SimpleNamespace(
+            case="send-dm", marker=MARKER, reply="", delivery_alias="d", attempt=1,
+        )
+        monkeypatch.setenv("F61_A2_DM_TARGET", "operator-alias-target")
+        rc = await driver.run(args)
+        out = json.loads(capsys.readouterr().out)
+        assert rc == 1
+        assert out["exclusive_window_valid"] is False
+        assert out["requires_rerun"] is True
+
+    @pytest.mark.asyncio
+    async def test_benign_event_does_not_fail_the_run(self, monkeypatch, capsys):
+        """Only the documented benign event (enter_chat) keeps the window valid."""
+        adapter = FakeAdapter(response=good_response())
+        monkeypatch.setattr(driver, "build_adapter", lambda: adapter)
+        monkeypatch.setattr(
+            driver, "install_event_spy",
+            lambda ad, events: events.append("enter_chat"),
+        )
+        import types
+        args = types.SimpleNamespace(
+            case="send-dm", marker=MARKER, reply="", delivery_alias="d", attempt=1,
+        )
+        monkeypatch.setenv("F61_A2_DM_TARGET", "operator-alias-target")
+        rc = await driver.run(args)
+        out = json.loads(capsys.readouterr().out)
+        assert rc == 0
+        assert out["exclusive_window_valid"] is True
+        assert out["observed_event_classes"] == ["enter_chat"]
+
+    @pytest.mark.asyncio
+    async def test_unclassified_event_fails_closed(self, monkeypatch, capsys):
+        """Unknown/malformed events ('other') invalidate the window too."""
+        adapter = FakeAdapter(response=good_response())
+        monkeypatch.setattr(driver, "build_adapter", lambda: adapter)
+        monkeypatch.setattr(
+            driver, "install_event_spy",
+            lambda ad, events: events.append("other"),
+        )
         import types
         args = types.SimpleNamespace(
             case="send-dm", marker=MARKER, reply="", delivery_alias="d", attempt=1,
