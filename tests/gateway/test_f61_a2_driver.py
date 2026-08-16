@@ -605,6 +605,7 @@ class TestRetryabilityClass:
             (60011, "permanent"),
             (60111, "permanent"),
             (81013, "permanent"),
+            (93006, "permanent"),  # invalid group/chat ID; observed live in A2-02
             (45009, "transient"),
             (45047, "unknown"),  # absent from the cited appendix as of 2026-08-15
             (42001, "transient"),
@@ -639,6 +640,21 @@ class TestRetryabilityClass:
     async def test_documented_permanent_target_error_passes(self):
         adapter = FakeAdapter(
             response=good_response(errcode=60111, errmsg="userid not found")
+        )
+        result = await driver.attempt_send(adapter, chat_id="t", content="hi")
+        assert result["transport_outcome"] == "rejected_by_platform"
+        assert result["errmsg_class"] == "target"
+        assert result["retryability_class"] == "permanent"
+        complete, criterion, rerun = driver.evaluate_case("send-invalid", result)
+        assert (complete, criterion, rerun) == (True, True, False)
+
+    @pytest.mark.asyncio
+    async def test_93006_observed_in_a202_satisfies_criterion(self):
+        """The actual A2-02 live result: 93006 is the documented
+        invalid-group-ID error, classified permanent by project retry
+        policy (not a vendor-stated retry attribute)."""
+        adapter = FakeAdapter(
+            response=good_response(errcode=93006, errmsg="invalid group id")
         )
         result = await driver.attempt_send(adapter, chat_id="t", content="hi")
         assert result["transport_outcome"] == "rejected_by_platform"

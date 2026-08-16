@@ -78,12 +78,15 @@ def _enum_label(value, allowed) -> str:
 # (https://developer.work.weixin.qq.com/document/path/90313, checked
 # 2026-08-15): 60011 no privilege for the specified member/dept/tag; 60111
 # UserID does not exist; 81013 all of UserID/dept/tag illegal or
-# unauthorized; 42001/42007 token expired; 45009 frequency limited.
+# unauthorized; 42001/42007 token expired; 45009 frequency limited;
+# 93006 invalid group ID (official appendix wording; added 2026-08-16 after
+# a live A2-02 observation returned it — classified permanent by project
+# retry policy, not by any vendor-stated retry attribute).
 # The permanent/transient split is PROJECT RETRY POLICY — "permanent" means
 # "must not auto-retry the same request and configuration" — not a
 # vendor-stated retry attribute. Only codes verified in the cited appendix
 # appear here (45047 was removed 2026-08-15: absent from the appendix).
-PERMANENT_TARGET_ERRCODES = {60011, 60111, 81013}
+PERMANENT_TARGET_ERRCODES = {60011, 60111, 81013, 93006}
 TRANSIENT_ERRCODES = {42001, 42007, 45009}
 
 
