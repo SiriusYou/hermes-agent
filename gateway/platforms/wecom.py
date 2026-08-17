@@ -59,8 +59,17 @@ except ImportError:
     httpx = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
-from gateway.integrations.youpet import YouPetBridge, YouPetBridgeError, youpet_settings_from_env
-from gateway.platforms.helpers import MessageDeduplicator
+from gateway.integrations.youpet import (
+    YouPetBridge,
+    YouPetBridgeError,
+    apply_outbox_poll_owner,
+    youpet_settings_from_env,
+)
+from gateway.platforms.helpers import (
+    MessageDeduplicator,
+    cancel_task_quietly,
+    run_rollback_stages,
+)
 from gateway.platforms.wecom_frame_capture import FrameCapture
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -93,6 +102,19 @@ MAX_MESSAGE_LENGTH = 4000
 CONNECT_TIMEOUT_SECONDS = 20.0
 REQUEST_TIMEOUT_SECONDS = 15.0
 HEARTBEAT_INTERVAL_SECONDS = 30.0
+
+
+class WeComCleanupIncompleteError(RuntimeError):
+    """A cleanup stage could not confirm resource release.
+
+    Carries only fixed stage labels on ``.unconfirmed``; the underlying close
+    exceptions are logged by the rollback-stage runner under fixed labels and
+    never echoed here.
+    """
+
+    def __init__(self, labels):
+        self.unconfirmed = tuple(labels)
+        super().__init__("wecom cleanup incomplete")
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 
 DEDUP_MAX_SIZE = 1000
@@ -238,17 +260,64 @@ class WeComAdapter(BasePlatformAdapter):
             self._mark_connected()
             self._listen_task = asyncio.create_task(self._listen_loop())
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+            if self._youpet_bridge:
+                # The bridge lifecycle belongs to the real adapter: when this
+                # surface owns outbox polling, its poller starts only after the
+                # connection is up, and any start failure rolls the whole
+                # connection back (handled by the shared except below).
+                await self._youpet_bridge.start()
             logger.info("[%s] Connected to %s", self.name, self._ws_url)
             return True
         except Exception as exc:
             message = f"WeCom startup failed: {exc}"
-            self._set_fatal_error("wecom_connect_error", message, retryable=True)
             logger.error("[%s] Failed to connect: %s", self.name, exc, exc_info=True)
-            await self._cleanup_ws()
-            if self._http_client:
-                await self._http_client.aclose()
-                self._http_client = None
+            unconfirmed = await self._rollback_connect()
+            if isinstance(exc, WeComCleanupIncompleteError):
+                # Cleanup failed before this connect attempt began; fold those
+                # labels in so the outcome is non-retryable either way.
+                unconfirmed = [*exc.unconfirmed, *unconfirmed]
+            if unconfirmed:
+                labels = ",".join(unconfirmed)
+                logger.error(
+                    "[%s] Rollback incomplete: unconfirmed=%s", self.name, labels,
+                )
+                message = f"{message}; rollback unconfirmed: {labels}"
+            # An incomplete rollback must not feed the auto-reconnect queue:
+            # recovery then requires process-level intervention.
+            self._set_fatal_error(
+                "wecom_connect_error", message, retryable=not unconfirmed,
+            )
             return False
+
+    async def _rollback_connect(self) -> list:
+        """Staged rollback of a failed connect().
+
+        Every stage runs independently so one failure cannot skip the rest.
+        References are cleared up front; stages whose release could not be
+        confirmed are returned as labels for explicit reporting.
+        """
+        stages = []
+        for task_attr, label in (
+            ("_listen_task", "listener"),
+            ("_heartbeat_task", "heartbeat"),
+        ):
+            task = getattr(self, task_attr, None)
+            setattr(self, task_attr, None)
+            if task is not None:
+                stages.append((label, lambda t=task: cancel_task_quietly(t)))
+        if self._youpet_bridge:
+            stages.append(("youpet_bridge", self._youpet_bridge.stop))
+
+        async def ws_stage():
+            unconfirmed = await self._cleanup_ws()
+            if unconfirmed:
+                raise RuntimeError("ws_cleanup_incomplete")
+
+        stages.append(("websocket", ws_stage))
+        http_client, self._http_client = self._http_client, None
+        if http_client is not None:
+            stages.append(("http_client", lambda c=http_client: c.aclose()))
+        return await run_rollback_stages(self.name, stages)
 
     async def disconnect(self) -> None:
         """Disconnect from WeCom."""
@@ -272,7 +341,7 @@ class WeComAdapter(BasePlatformAdapter):
             self._heartbeat_task = None
 
         self._fail_pending_responses(RuntimeError("WeCom adapter disconnected"))
-        await self._cleanup_ws()
+        unconfirmed = await self._cleanup_ws()
 
         if self._http_client:
             await self._http_client.aclose()
@@ -281,31 +350,52 @@ class WeComAdapter(BasePlatformAdapter):
             await self._youpet_bridge.stop()
 
         self._dedup.clear()
+        if unconfirmed:
+            # Remaining cleanup above still ran; the caller must observe the
+            # failure instead of a successful disconnect record.
+            logger.error(
+                "[%s] Disconnect incomplete: unconfirmed=%s",
+                self.name,
+                ",".join(unconfirmed),
+            )
+            raise WeComCleanupIncompleteError(unconfirmed)
         logger.info("[%s] Disconnected", self.name)
 
     def _build_youpet_bridge(self) -> Optional[YouPetBridge]:
-        settings = youpet_settings_from_env()
+        settings = apply_outbox_poll_owner(youpet_settings_from_env(), "wecom")
         if not settings.enabled:
             return None
-        # The AI Bot adapter only uses the bridge for inbound DM/group writes.
-        # Outbox polling remains owned by the callback bridge to avoid duplicate
-        # consumers when both WeCom surfaces are enabled.
-        settings.outbox_poll_enabled = False
+        # The AI Bot adapter polls the Core outbox only when explicitly named the
+        # poll owner (YOUPET_OUTBOX_POLL_OWNER=wecom). Otherwise polling remains
+        # owned by the callback bridge to avoid duplicate consumers when both
+        # WeCom surfaces are enabled.
         return YouPetBridge(settings, self.send)
 
-    async def _cleanup_ws(self) -> None:
-        """Close the live websocket/session, if any."""
-        if self._ws and not self._ws.closed:
-            await self._ws.close()
-        self._ws = None
+    async def _cleanup_ws(self) -> list:
+        """Detach and close the live websocket/session, if any.
 
-        if self._session and not self._session.closed:
-            await self._session.close()
-        self._session = None
+        Both references are detached up front so neither close can block the
+        other or leave the adapter holding a stale handle. Close failures are
+        failure-independent, logged with fixed per-resource labels only, and
+        returned as labels so callers can report incomplete cleanup instead
+        of assuming release.
+        """
+        ws, self._ws = self._ws, None
+        session, self._session = self._session, None
+        stages = []
+        if ws is not None and not ws.closed:
+            stages.append(("ws_close", lambda: ws.close()))
+        if session is not None and not session.closed:
+            stages.append(("ws_session_close", lambda: session.close()))
+        return await run_rollback_stages(self.name, stages)
 
     async def _open_connection(self) -> None:
         """Open and authenticate a websocket connection."""
-        await self._cleanup_ws()
+        unconfirmed = await self._cleanup_ws()
+        if unconfirmed:
+            # Never open a replacement connection while the previous one's
+            # release is unconfirmed (competing-connection risk).
+            raise WeComCleanupIncompleteError(unconfirmed)
         self._session = aiohttp.ClientSession(trust_env=True)
         self._ws = await self._session.ws_connect(
             self._ws_url,
@@ -356,6 +446,20 @@ class WeComAdapter(BasePlatformAdapter):
             elif msg.type in {aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR}:
                 raise RuntimeError("WeCom websocket closed during authentication")
 
+    def _on_notify_done(self, task: "asyncio.Task") -> None:
+        """Report a failed fatal notification safely, then release the task."""
+        try:
+            if task.cancelled():
+                return
+            exc = task.exception()
+            if exc is not None:
+                logger.warning(
+                    "[Wecom] Fatal-error notification failed: %s",
+                    type(exc).__name__,
+                )
+        finally:
+            self._background_tasks.discard(task)
+
     async def _listen_loop(self) -> None:
         """Read websocket events forever, reconnecting on errors."""
         backoff_idx = 0
@@ -380,6 +484,27 @@ class WeComAdapter(BasePlatformAdapter):
                     backoff_idx = 0
                     self._mark_connected()
                     logger.info("[%s] Reconnected", self.name)
+                except WeComCleanupIncompleteError as cleanup_exc:
+                    # A stale connection's release is unconfirmed: terminal
+                    # for this process, not a retryable blip. Exit the loop
+                    # and hand process-level recovery to the gateway.
+                    labels = ",".join(cleanup_exc.unconfirmed)
+                    self._set_fatal_error(
+                        "wecom_cleanup_incomplete",
+                        f"WeCom listen loop stopped; cleanup unconfirmed: {labels}",
+                        retryable=False,
+                    )
+                    # Notify from a fresh task: the gateway handler calls
+                    # disconnect(), which cancels/awaits this very listen
+                    # task. This coroutine returns without yielding after
+                    # create_task, so the listen task is already done when
+                    # the notification runs — no self-await/self-cancel. The
+                    # task is load-bearing for gateway recovery, so it is
+                    # owned by the shared background-task registry.
+                    notify_task = asyncio.create_task(self._notify_fatal_error())
+                    self._background_tasks.add(notify_task)
+                    notify_task.add_done_callback(self._on_notify_done)
+                    return
                 except Exception as reconnect_exc:
                     logger.warning("[%s] Reconnect failed: %s", self.name, reconnect_exc)
 

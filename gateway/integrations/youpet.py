@@ -41,6 +41,27 @@ class YouPetBridgeError(RuntimeError):
     """Raised when the YouPet bridge cannot complete a required side effect."""
 
 
+# Exactly one WeCom surface may poll the Core outbox. The owner is selected
+# explicitly via YOUPET_OUTBOX_POLL_OWNER; the default preserves the legacy
+# behavior where the callback adapter owns polling.
+OUTBOX_POLL_OWNERS = frozenset({"wecom", "wecom_callback", "none"})
+DEFAULT_OUTBOX_POLL_OWNER = "wecom_callback"
+
+# F6.1 A2-04 evidence hook: when armed (and only on the wecom poll owner),
+# the first N outbound sends fail with this fixed label instead of emitting a
+# frame, so the Core delivery-ledger retry path can be exercised on purpose.
+FAULT_INJECTION_ERROR_LABEL = "F61_A204_INJECTED_TRANSIENT_SEND_FAILURE"
+
+# Process-wide registry of bridges that currently own outbox polling. A second
+# polling bridge means misconfigured ownership and must fail closed.
+_ACTIVE_POLL_OWNERS: set[str] = set()
+
+# Bound for per-delivery send-attempt bookkeeping (ordinals and aliases).
+# Terminal deliveries are cleared on ack; never-terminal entries are evicted
+# oldest-first beyond this cap.
+MAX_ATTEMPT_TRACKED_DELIVERIES = 1000
+
+
 SendCallable = Callable[[str, str], Awaitable[SendResult]]
 
 
@@ -69,6 +90,8 @@ class YouPetBridgeSettings:
     corp_id: Optional[str] = None
     default_chat_id: Optional[str] = None
     user_chat_map: dict[str, str] = field(default_factory=dict)
+    outbox_poll_owner: str = DEFAULT_OUTBOX_POLL_OWNER
+    fault_inject_send_failures: int = 0
 
     @property
     def configured(self) -> bool:
@@ -76,10 +99,74 @@ class YouPetBridgeSettings:
 
 
 def build_youpet_bridge_from_env(send: SendCallable) -> Optional["YouPetBridge"]:
-    settings = youpet_settings_from_env()
+    settings = apply_outbox_poll_owner(youpet_settings_from_env(), "wecom_callback")
     if not settings.enabled:
         return None
+    # The transient-failure hook is armed only by the long-connection adapter
+    # when it owns polling (F6.1 A2-04 evidence); the callback surface never
+    # arms it, even if the env var is set.
+    settings.fault_inject_send_failures = 0
     return YouPetBridge(settings, send)
+
+
+def resolve_outbox_poll_owner() -> str:
+    raw = os.getenv("YOUPET_OUTBOX_POLL_OWNER", "").strip()
+    if not raw:
+        return DEFAULT_OUTBOX_POLL_OWNER
+    if raw not in OUTBOX_POLL_OWNERS:
+        raise YouPetBridgeError(
+            "Invalid YOUPET_OUTBOX_POLL_OWNER; expected one of "
+            f"{sorted(OUTBOX_POLL_OWNERS)}",
+        )
+    return raw
+
+
+def apply_outbox_poll_owner(
+    settings: YouPetBridgeSettings,
+    adapter: str,
+) -> YouPetBridgeSettings:
+    """Force polling off on every adapter except the selected owner."""
+    settings.outbox_poll_enabled = (
+        settings.outbox_poll_enabled and settings.outbox_poll_owner == adapter
+    )
+    return settings
+
+
+def _validated_core_attempts(raw: Any) -> int:
+    """Return the Core attempts count, failing closed on any other shape.
+
+    The value is embedded into durable log lines, so it must be a real
+    non-negative integer (bool excluded): anything else could smuggle forged
+    log content. The error carries a fixed label, never the raw value.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        raise YouPetBridgeError(
+            "Core outbox item carried an invalid attempts field",
+        )
+    return raw
+
+
+def _fault_inject_send_failures_from_env(owner: str) -> int:
+    raw = os.getenv("YOUPET_WECOM_SEND_FAULT_INJECTIONS", "").strip()
+    if not raw:
+        return 0
+    try:
+        count = int(raw)
+    except ValueError:
+        raise YouPetBridgeError(
+            "Invalid YOUPET_WECOM_SEND_FAULT_INJECTIONS; expected an integer",
+        ) from None
+    if count < 0:
+        raise YouPetBridgeError(
+            "YOUPET_WECOM_SEND_FAULT_INJECTIONS must not be negative",
+        )
+    if count > 0 and owner != "wecom":
+        raise YouPetBridgeError(
+            "YOUPET_WECOM_SEND_FAULT_INJECTIONS requires "
+            "YOUPET_OUTBOX_POLL_OWNER=wecom; the fault hook may only be armed on "
+            "the long-connection poll owner",
+        )
+    return count
 
 
 def _poll_counts() -> YouPetPollCounts:
@@ -94,6 +181,7 @@ def _poll_counts() -> YouPetPollCounts:
 
 
 def youpet_settings_from_env() -> YouPetBridgeSettings:
+    poll_owner = resolve_outbox_poll_owner()
     user_chat_map: dict[str, str] = {}
     raw_map = os.getenv("YOUPET_WECOM_USER_CHAT_MAP_JSON", "").strip()
     if raw_map:
@@ -108,7 +196,7 @@ def youpet_settings_from_env() -> YouPetBridgeSettings:
         except json.JSONDecodeError:
             logger.warning("[YouPetBridge] Invalid YOUPET_WECOM_USER_CHAT_MAP_JSON")
 
-    return YouPetBridgeSettings(
+    settings = YouPetBridgeSettings(
         enabled=_env_bool("YOUPET_WECOM_BRIDGE_ENABLED", default=False),
         core_base_url=os.getenv("YOUPET_CORE_BASE_URL", "").rstrip("/"),
         service_token=os.getenv("YOUPET_SERVICE_TOKEN", ""),
@@ -129,7 +217,19 @@ def youpet_settings_from_env() -> YouPetBridgeSettings:
         ),
         default_chat_id=os.getenv("YOUPET_WECOM_DEFAULT_CHAT_ID") or None,
         user_chat_map=user_chat_map,
+        outbox_poll_owner=poll_owner,
+        fault_inject_send_failures=_fault_inject_send_failures_from_env(poll_owner),
     )
+    # Arming the fault hook on a poller that can never run is a
+    # misconfiguration, not a test setup: fail closed before startup.
+    if settings.fault_inject_send_failures > 0 and not (
+        settings.enabled and settings.configured and settings.outbox_poll_enabled
+    ):
+        raise YouPetBridgeError(
+            "YOUPET_WECOM_SEND_FAULT_INJECTIONS requires an enabled, configured "
+            "bridge with outbox polling on; refusing to arm on an inert poller",
+        )
+    return settings
 
 
 class YouPetBridge:
@@ -140,9 +240,17 @@ class YouPetBridge:
         self._send = send
         self._client: Optional[httpx.AsyncClient] = None
         self._poll_task: Optional[asyncio.Task] = None
+        self._poll_owner_claimed = False
         self._runtime_user_chat_map: dict[str, str] = {}
         self._processed_event_id_order = self._load_processed_event_ids()
         self._processed_event_ids = set(self._processed_event_id_order)
+        self._fault_injections_remaining = settings.fault_inject_send_failures
+        # Per-delivery send-attempt bookkeeping. Process-local and observational
+        # only: Core outbox_deliveries.attempts is the auditable authority.
+        self._transport_ordinals: dict[str, int] = {}
+        self._delivery_aliases: dict[str, str] = {}
+        self._business_aliases: dict[str, str] = {}
+        self._alias_seq = 0
 
     async def start(self) -> None:
         if not self.settings.configured:
@@ -151,10 +259,36 @@ class YouPetBridge:
                 "YOUPET_CORE_BASE_URL and YOUPET_SERVICE_TOKEN",
             )
             return
-        self._ensure_client()
-        if self.settings.outbox_poll_enabled and self._poll_task is None:
-            self._poll_task = asyncio.create_task(self._poll_loop())
-            logger.info("[YouPetBridge] Started Core outbox poller")
+        if not (self.settings.outbox_poll_enabled and self._poll_task is None):
+            self._ensure_client()
+            return
+        # Transactional startup: reject a duplicate owner before allocating
+        # anything, and roll back client, task, and owner claim on any
+        # failure so a failed start leaves no resources behind.
+        owner = self.settings.outbox_poll_owner
+        if _ACTIVE_POLL_OWNERS:
+            raise YouPetBridgeError(
+                f"Refusing to start a second Core outbox poller ({owner!r}); "
+                f"already owned by {sorted(_ACTIVE_POLL_OWNERS)}",
+            )
+        _ACTIVE_POLL_OWNERS.add(owner)
+        try:
+            self._ensure_client()
+            poll_coro = self._poll_loop()
+            try:
+                self._poll_task = asyncio.create_task(poll_coro)
+            except Exception:
+                poll_coro.close()
+                raise
+        except Exception:
+            _ACTIVE_POLL_OWNERS.discard(owner)
+            if self._client is not None:
+                await self._client.aclose()
+                self._client = None
+            self._poll_task = None
+            raise
+        self._poll_owner_claimed = True
+        logger.info("[YouPetBridge] Started Core outbox poller")
 
     async def stop(self) -> None:
         if self._poll_task:
@@ -164,6 +298,9 @@ class YouPetBridge:
             except asyncio.CancelledError:
                 pass
             self._poll_task = None
+        if self._poll_owner_claimed:
+            _ACTIVE_POLL_OWNERS.discard(self.settings.outbox_poll_owner)
+            self._poll_owner_claimed = False
         if self._client:
             await self._client.aclose()
             self._client = None
@@ -236,6 +373,7 @@ class YouPetBridge:
                     if legacy_processed:
                         self._replace_processed_event_id(delivery_id, business_event_id)
                     await self._ack(delivery_id)
+                    self._clear_attempt_state(delivery_id)
                     counts["acked"] += 1
                     continue
                 sent = await self._process_outbox_item(item)
@@ -243,11 +381,12 @@ class YouPetBridge:
                     counts["sent"] += 1
                 self._remember_processed_event_id(business_event_id)
                 await self._ack(delivery_id)
+                self._clear_attempt_state(delivery_id)
                 counts["acked"] += 1
             except Exception as exc:
                 logger.warning(
                     "[YouPetBridge] Failed to process outbox event %s: %s",
-                    delivery_id,
+                    self._alias_for(self._delivery_aliases, delivery_id, "d"),
                     exc,
                 )
                 await self._nack(delivery_id, str(exc))
@@ -300,9 +439,20 @@ class YouPetBridge:
 
         payload = self._business_payload(envelope, event_type)
 
+        attempt_ctx = {
+            "delivery_id": str(item.get("event_id") or ""),
+            "business_event_id": self._required_business_event_id(item),
+            "event_type": event_type,
+            "core_attempts": _validated_core_attempts(item.get("attempts")),
+        }
+
         if event_type in {"task.created", "task.reminder_due"}:
             chat_id = self._resolve_chat_id(payload, ("recipient_user_id", "owner_user_id"))
-            await self._send_required(chat_id, self._render_task_message(event_type, payload))
+            await self._send_required(
+                chat_id,
+                self._render_task_message(event_type, payload),
+                attempt_ctx,
+            )
             return True
 
         if event_type == "task.escalated":
@@ -311,7 +461,11 @@ class YouPetBridge:
                 ("recipient_user_id",),
                 allow_default=False,
             )
-            await self._send_required(chat_id, self._render_alert_message(event_type, payload))
+            await self._send_required(
+                chat_id,
+                self._render_alert_message(event_type, payload),
+                attempt_ctx,
+            )
             return True
 
         if event_type == "alert.created":
@@ -322,7 +476,11 @@ class YouPetBridge:
             payload,
             ("recipient_user_id", "owner_user_id", "assigned_to"),
         )
-        await self._send_required(chat_id, self._render_alert_message(event_type, payload))
+        await self._send_required(
+            chat_id,
+            self._render_alert_message(event_type, payload),
+            attempt_ctx,
+        )
         return True
 
     @staticmethod
@@ -442,10 +600,108 @@ class YouPetBridge:
             return self.settings.default_chat_id
         raise YouPetBridgeError("No WeCom chat_id for YouPet outbox recipient")
 
-    async def _send_required(self, chat_id: str, content: str) -> None:
-        result = await self._send(chat_id, content)
+    def _alias_for(self, mapping: dict[str, str], raw: str, prefix: str) -> str:
+        """Map a raw identifier to a stable process-local alias for logging.
+
+        Aliases preserve equality relationships without persisting raw Core
+        IDs. The sequence is monotonic, so evicted aliases are never reused.
+        """
+        alias = mapping.get(raw)
+        if alias is None:
+            if len(mapping) >= MAX_ATTEMPT_TRACKED_DELIVERIES:
+                mapping.pop(next(iter(mapping)))
+            self._alias_seq += 1
+            alias = f"{prefix}-{self._alias_seq:04d}"
+            mapping[raw] = alias
+        return alias
+
+    def _next_transport_ordinal(self, delivery_id: str) -> int:
+        if (
+            delivery_id not in self._transport_ordinals
+            and len(self._transport_ordinals) >= MAX_ATTEMPT_TRACKED_DELIVERIES
+        ):
+            # Evict the oldest-tracked delivery; a still-retrying evicted
+            # delivery restarts its process-local ordinal at 1.
+            self._transport_ordinals.pop(next(iter(self._transport_ordinals)))
+        ordinal = self._transport_ordinals.get(delivery_id, 0) + 1
+        self._transport_ordinals[delivery_id] = ordinal
+        return ordinal
+
+    def _clear_attempt_state(self, delivery_id: str) -> None:
+        """Drop per-delivery bookkeeping once the row reaches a terminal ack.
+
+        The business alias is intentionally retained: other outer deliveries
+        may still represent the same inner event, and alias equality is itself
+        evidence. It stays bounded by its own FIFO cap instead.
+        """
+        self._transport_ordinals.pop(delivery_id, None)
+        self._delivery_aliases.pop(delivery_id, None)
+
+    @staticmethod
+    def _log_outbox_send_attempt(
+        ctx: dict[str, Any],
+        outcome: str,
+        error_label: str = "-",
+    ) -> None:
+        # The production formatter persists %(message)s only, so every
+        # evidence field must be embedded in the message itself. Fields are a
+        # fixed safe contract: aliases, enums, and counts — never raw Core
+        # UUIDs or provider error text.
+        logger.info(
+            "[YouPetBridge] outbox_send_attempt"
+            " delivery_alias=%s business_alias=%s event_type=%s"
+            " core_attempts=%s transport_ordinal=%s outcome=%s error_label=%s",
+            ctx.get("delivery_alias"),
+            ctx.get("business_alias"),
+            ctx.get("event_type"),
+            ctx.get("core_attempts"),
+            ctx.get("transport_ordinal"),
+            outcome,
+            error_label,
+        )
+
+    async def _send_required(
+        self,
+        chat_id: str,
+        content: str,
+        attempt_ctx: dict[str, Any],
+    ) -> None:
+        ctx = {
+            "delivery_alias": self._alias_for(
+                self._delivery_aliases, attempt_ctx["delivery_id"], "d",
+            ),
+            "business_alias": self._alias_for(
+                self._business_aliases, attempt_ctx["business_event_id"], "b",
+            ),
+            "event_type": attempt_ctx["event_type"],
+            "core_attempts": attempt_ctx["core_attempts"],
+            "transport_ordinal": self._next_transport_ordinal(
+                attempt_ctx["delivery_id"],
+            ),
+        }
+        if self._fault_injections_remaining > 0:
+            self._fault_injections_remaining -= 1
+            self._log_outbox_send_attempt(
+                ctx,
+                outcome="injected_failure",
+                error_label=FAULT_INJECTION_ERROR_LABEL,
+            )
+            raise YouPetBridgeError(FAULT_INJECTION_ERROR_LABEL)
+        try:
+            result = await self._send(chat_id, content)
+        except Exception as exc:
+            self._log_outbox_send_attempt(
+                ctx,
+                outcome="failed",
+                error_label="send_exception",
+            )
+            # Preserve the original exception via chaining while persisting
+            # only a fixed label in logs and the Core nack payload.
+            raise YouPetBridgeError("WeCom send failed: send_exception") from exc
         if isinstance(result, SendResult) and not result.success:
+            self._log_outbox_send_attempt(ctx, outcome="failed", error_label="send_rejected")
             raise YouPetBridgeError(result.error or "WeCom send failed")
+        self._log_outbox_send_attempt(ctx, outcome="sent")
 
     async def _ack(self, event_id: str) -> None:
         if not event_id:

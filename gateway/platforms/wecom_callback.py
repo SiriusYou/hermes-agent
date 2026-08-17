@@ -48,6 +48,7 @@ except ImportError:
 
 from gateway.config import Platform, PlatformConfig
 from gateway.integrations.youpet import YouPetBridgeError, build_youpet_bridge_from_env
+from gateway.platforms.helpers import cancel_task_quietly, run_rollback_stages
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from gateway.platforms.wecom_crypto import WXBizMsgCrypt, WeComCryptoError
 from hermes_constants import get_hermes_home
@@ -186,9 +187,45 @@ class WecomCallbackAdapter(BasePlatformAdapter):
                     )
             return True
         except Exception:
-            await self._cleanup()
+            unconfirmed = await self._rollback_connect()
             logger.exception("[WecomCallback] Failed to start")
+            if unconfirmed:
+                labels = ",".join(unconfirmed)
+                logger.error(
+                    "[WecomCallback] Rollback incomplete: unconfirmed=%s",
+                    labels,
+                )
+                # An incomplete rollback must not be treated as a transient
+                # failure: recovery requires process-level intervention.
+                self._set_fatal_error(
+                    "wecom_callback_rollback_incomplete",
+                    f"WeCom callback startup failed; rollback unconfirmed: {labels}",
+                    retryable=False,
+                )
             return False
+
+    async def _rollback_connect(self) -> list:
+        """Staged rollback of a failed connect().
+
+        Every stage runs independently so one failure cannot skip the rest.
+        References are cleared up front; stages whose release could not be
+        confirmed are returned as labels for explicit reporting.
+        """
+        stages = []
+        if self._youpet_bridge:
+            stages.append(("youpet_bridge", self._youpet_bridge.stop))
+        poll_task, self._poll_task = self._poll_task, None
+        if poll_task is not None:
+            stages.append(("poll_task", lambda t=poll_task: cancel_task_quietly(t)))
+        self._site = None
+        self._app = None
+        runner, self._runner = self._runner, None
+        if runner is not None:
+            stages.append(("runner", lambda r=runner: r.cleanup()))
+        http_client, self._http_client = self._http_client, None
+        if http_client is not None:
+            stages.append(("http_client", lambda c=http_client: c.aclose()))
+        return await run_rollback_stages(self.name, stages)
 
     async def disconnect(self) -> None:
         self._running = False

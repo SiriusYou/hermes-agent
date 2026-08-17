@@ -21,6 +21,41 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# ─── Rollback stages ──────────────────────────────────────────────────────────
+
+
+async def cancel_task_quietly(task: "asyncio.Task") -> None:
+    """Cancel a task and await it, treating CancelledError as success.
+
+    Any other exception (including the task's own failure) propagates so the
+    caller can treat the stage as unconfirmed.
+    """
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+async def run_rollback_stages(owner: str, stages: list) -> list:
+    """Run ``(label, action)`` rollback stages independently.
+
+    One stage's failure never skips later stages. Stage failures are logged
+    with the fixed stage label only (never the exception payload) and
+    collected; the caller reports the returned unconfirmed labels. Resource
+    references should be cleared by the caller when staging, so an
+    unconfirmed stage is always reported rather than silently retried.
+    """
+    unconfirmed: list = []
+    for label, action in stages:
+        try:
+            await action()
+        except Exception:
+            logger.warning("[%s] Rollback stage failed: stage=%s", owner, label)
+            unconfirmed.append(label)
+    return unconfirmed
+
+
 # ─── Message Deduplication ────────────────────────────────────────────────────
 
 
