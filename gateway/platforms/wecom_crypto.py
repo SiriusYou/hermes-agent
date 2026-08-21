@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import os
 import secrets
 import socket
@@ -87,7 +88,10 @@ class WXBizMsgCrypt:
 
     def decrypt(self, msg_signature: str, timestamp: str, nonce: str, encrypt: str) -> bytes:
         expected = _sha1_signature(self.token, timestamp, nonce, encrypt)
-        if expected != msg_signature:
+        if not hmac.compare_digest(
+            msg_signature.encode("utf-8"),
+            expected.encode("utf-8"),
+        ):
             raise SignatureError("signature mismatch")
         try:
             cipher_text = base64.b64decode(encrypt)

@@ -59,7 +59,18 @@ except ImportError:
     httpx = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.helpers import MessageDeduplicator
+from gateway.integrations.youpet import (
+    YouPetBridge,
+    YouPetBridgeError,
+    apply_outbox_poll_owner,
+    youpet_settings_from_env,
+)
+from gateway.platforms.helpers import (
+    MessageDeduplicator,
+    cancel_task_quietly,
+    run_rollback_stages,
+)
+from gateway.platforms.wecom_frame_capture import FrameCapture
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -91,6 +102,19 @@ MAX_MESSAGE_LENGTH = 4000
 CONNECT_TIMEOUT_SECONDS = 20.0
 REQUEST_TIMEOUT_SECONDS = 15.0
 HEARTBEAT_INTERVAL_SECONDS = 30.0
+
+
+class WeComCleanupIncompleteError(RuntimeError):
+    """A cleanup stage could not confirm resource release.
+
+    Carries only fixed stage labels on ``.unconfirmed``; the underlying close
+    exceptions are logged by the rollback-stage runner under fixed labels and
+    never echoed here.
+    """
+
+    def __init__(self, labels):
+        self.unconfirmed = tuple(labels)
+        super().__init__("wecom cleanup incomplete")
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 
 DEDUP_MAX_SIZE = 1000
@@ -175,6 +199,15 @@ class WeComAdapter(BasePlatformAdapter):
         self._pending_responses: Dict[str, asyncio.Future] = {}
         self._dedup = MessageDeduplicator(max_size=DEDUP_MAX_SIZE)
         self._reply_req_ids: Dict[str, str] = {}
+        self._youpet_bridge = self._build_youpet_bridge()
+        # F6.1 evidence hook: default-off unless YOUPET_WECOM_FRAME_CAPTURE_DIR
+        # names a validated owner-only directory. See wecom_frame_capture.py.
+        self._frame_capture = FrameCapture()
+        # A1-07 evidence: env-gated whitelist audit log for event callbacks.
+        # Unset means zero logs and zero behavior change.
+        self._event_observe = os.getenv("YOUPET_WECOM_EVENT_OBSERVE", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
 
         # Text batching: merge rapid successive messages (Telegram-style).
         # WeCom clients split long messages around 4000 chars.
@@ -206,6 +239,16 @@ class WeComAdapter(BasePlatformAdapter):
             self._set_fatal_error("wecom_missing_credentials", message, retryable=True)
             logger.warning("[%s] %s", self.name, message)
             return False
+        if self._frame_capture.requested and not self._frame_capture.enabled:
+            # Evidence capture was requested but the directory failed
+            # validation: refuse to run live traffic without it.
+            message = (
+                "WeCom startup failed: YOUPET_WECOM_FRAME_CAPTURE_DIR is set but the "
+                "capture directory failed validation"
+            )
+            self._set_fatal_error("wecom_frame_capture_dir_invalid", message, retryable=False)
+            logger.error("[%s] %s", self.name, message)
+            return False
 
         try:
             # Tighter keepalive so idle CLOSE_WAIT drains promptly (#18451).
@@ -217,17 +260,64 @@ class WeComAdapter(BasePlatformAdapter):
             self._mark_connected()
             self._listen_task = asyncio.create_task(self._listen_loop())
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+            if self._youpet_bridge:
+                # The bridge lifecycle belongs to the real adapter: when this
+                # surface owns outbox polling, its poller starts only after the
+                # connection is up, and any start failure rolls the whole
+                # connection back (handled by the shared except below).
+                await self._youpet_bridge.start()
             logger.info("[%s] Connected to %s", self.name, self._ws_url)
             return True
         except Exception as exc:
             message = f"WeCom startup failed: {exc}"
-            self._set_fatal_error("wecom_connect_error", message, retryable=True)
             logger.error("[%s] Failed to connect: %s", self.name, exc, exc_info=True)
-            await self._cleanup_ws()
-            if self._http_client:
-                await self._http_client.aclose()
-                self._http_client = None
+            unconfirmed = await self._rollback_connect()
+            if isinstance(exc, WeComCleanupIncompleteError):
+                # Cleanup failed before this connect attempt began; fold those
+                # labels in so the outcome is non-retryable either way.
+                unconfirmed = [*exc.unconfirmed, *unconfirmed]
+            if unconfirmed:
+                labels = ",".join(unconfirmed)
+                logger.error(
+                    "[%s] Rollback incomplete: unconfirmed=%s", self.name, labels,
+                )
+                message = f"{message}; rollback unconfirmed: {labels}"
+            # An incomplete rollback must not feed the auto-reconnect queue:
+            # recovery then requires process-level intervention.
+            self._set_fatal_error(
+                "wecom_connect_error", message, retryable=not unconfirmed,
+            )
             return False
+
+    async def _rollback_connect(self) -> list:
+        """Staged rollback of a failed connect().
+
+        Every stage runs independently so one failure cannot skip the rest.
+        References are cleared up front; stages whose release could not be
+        confirmed are returned as labels for explicit reporting.
+        """
+        stages = []
+        for task_attr, label in (
+            ("_listen_task", "listener"),
+            ("_heartbeat_task", "heartbeat"),
+        ):
+            task = getattr(self, task_attr, None)
+            setattr(self, task_attr, None)
+            if task is not None:
+                stages.append((label, lambda t=task: cancel_task_quietly(t)))
+        if self._youpet_bridge:
+            stages.append(("youpet_bridge", self._youpet_bridge.stop))
+
+        async def ws_stage():
+            unconfirmed = await self._cleanup_ws()
+            if unconfirmed:
+                raise RuntimeError("ws_cleanup_incomplete")
+
+        stages.append(("websocket", ws_stage))
+        http_client, self._http_client = self._http_client, None
+        if http_client is not None:
+            stages.append(("http_client", lambda c=http_client: c.aclose()))
+        return await run_rollback_stages(self.name, stages)
 
     async def disconnect(self) -> None:
         """Disconnect from WeCom."""
@@ -251,28 +341,61 @@ class WeComAdapter(BasePlatformAdapter):
             self._heartbeat_task = None
 
         self._fail_pending_responses(RuntimeError("WeCom adapter disconnected"))
-        await self._cleanup_ws()
+        unconfirmed = await self._cleanup_ws()
 
         if self._http_client:
             await self._http_client.aclose()
             self._http_client = None
+        if self._youpet_bridge:
+            await self._youpet_bridge.stop()
 
         self._dedup.clear()
+        if unconfirmed:
+            # Remaining cleanup above still ran; the caller must observe the
+            # failure instead of a successful disconnect record.
+            logger.error(
+                "[%s] Disconnect incomplete: unconfirmed=%s",
+                self.name,
+                ",".join(unconfirmed),
+            )
+            raise WeComCleanupIncompleteError(unconfirmed)
         logger.info("[%s] Disconnected", self.name)
 
-    async def _cleanup_ws(self) -> None:
-        """Close the live websocket/session, if any."""
-        if self._ws and not self._ws.closed:
-            await self._ws.close()
-        self._ws = None
+    def _build_youpet_bridge(self) -> Optional[YouPetBridge]:
+        settings = apply_outbox_poll_owner(youpet_settings_from_env(), "wecom")
+        if not settings.enabled:
+            return None
+        # The AI Bot adapter polls the Core outbox only when explicitly named the
+        # poll owner (YOUPET_OUTBOX_POLL_OWNER=wecom). Otherwise polling remains
+        # owned by the callback bridge to avoid duplicate consumers when both
+        # WeCom surfaces are enabled.
+        return YouPetBridge(settings, self.send)
 
-        if self._session and not self._session.closed:
-            await self._session.close()
-        self._session = None
+    async def _cleanup_ws(self) -> list:
+        """Detach and close the live websocket/session, if any.
+
+        Both references are detached up front so neither close can block the
+        other or leave the adapter holding a stale handle. Close failures are
+        failure-independent, logged with fixed per-resource labels only, and
+        returned as labels so callers can report incomplete cleanup instead
+        of assuming release.
+        """
+        ws, self._ws = self._ws, None
+        session, self._session = self._session, None
+        stages = []
+        if ws is not None and not ws.closed:
+            stages.append(("ws_close", lambda: ws.close()))
+        if session is not None and not session.closed:
+            stages.append(("ws_session_close", lambda: session.close()))
+        return await run_rollback_stages(self.name, stages)
 
     async def _open_connection(self) -> None:
         """Open and authenticate a websocket connection."""
-        await self._cleanup_ws()
+        unconfirmed = await self._cleanup_ws()
+        if unconfirmed:
+            # Never open a replacement connection while the previous one's
+            # release is unconfirmed (competing-connection risk).
+            raise WeComCleanupIncompleteError(unconfirmed)
         self._session = aiohttp.ClientSession(trust_env=True)
         self._ws = await self._session.ws_connect(
             self._ws_url,
@@ -323,6 +446,20 @@ class WeComAdapter(BasePlatformAdapter):
             elif msg.type in {aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR}:
                 raise RuntimeError("WeCom websocket closed during authentication")
 
+    def _on_notify_done(self, task: "asyncio.Task") -> None:
+        """Report a failed fatal notification safely, then release the task."""
+        try:
+            if task.cancelled():
+                return
+            exc = task.exception()
+            if exc is not None:
+                logger.warning(
+                    "[Wecom] Fatal-error notification failed: %s",
+                    type(exc).__name__,
+                )
+        finally:
+            self._background_tasks.discard(task)
+
     async def _listen_loop(self) -> None:
         """Read websocket events forever, reconnecting on errors."""
         backoff_idx = 0
@@ -347,6 +484,27 @@ class WeComAdapter(BasePlatformAdapter):
                     backoff_idx = 0
                     self._mark_connected()
                     logger.info("[%s] Reconnected", self.name)
+                except WeComCleanupIncompleteError as cleanup_exc:
+                    # A stale connection's release is unconfirmed: terminal
+                    # for this process, not a retryable blip. Exit the loop
+                    # and hand process-level recovery to the gateway.
+                    labels = ",".join(cleanup_exc.unconfirmed)
+                    self._set_fatal_error(
+                        "wecom_cleanup_incomplete",
+                        f"WeCom listen loop stopped; cleanup unconfirmed: {labels}",
+                        retryable=False,
+                    )
+                    # Notify from a fresh task: the gateway handler calls
+                    # disconnect(), which cancels/awaits this very listen
+                    # task. This coroutine returns without yielding after
+                    # create_task, so the listen task is already done when
+                    # the notification runs — no self-await/self-cancel. The
+                    # task is load-bearing for gateway recovery, so it is
+                    # owned by the shared background-task registry.
+                    notify_task = asyncio.create_task(self._notify_fatal_error())
+                    self._background_tasks.add(notify_task)
+                    notify_task.add_done_callback(self._on_notify_done)
+                    return
                 except Exception as reconnect_exc:
                     logger.warning("[%s] Reconnect failed: %s", self.name, reconnect_exc)
 
@@ -359,10 +517,21 @@ class WeComAdapter(BasePlatformAdapter):
             msg = await self._ws.receive()
             if msg.type == aiohttp.WSMsgType.TEXT:
                 payload = self._parse_json(msg.data)
-                if payload:
-                    await self._dispatch_payload(payload)
+                if payload is None:
+                    continue
+                if not self._capture_callback_frame(msg.data, payload):
+                    continue  # requested capture failed; never dispatch unrecorded callbacks
+                await self._dispatch_payload(payload)
             elif msg.type in {aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSING}:
                 raise RuntimeError("WeCom websocket closed")
+        if self._running:
+            # The read loop exited while still running: the socket was
+            # closed under us (e.g. a concurrent cleanup). Treat it exactly
+            # like an observed close so the caller's paced reconnect path
+            # runs — a silent normal return would be re-awaited instantly
+            # and may never yield to the event loop (2026-08-16 live
+            # 100%-CPU spin during the F6.1 A2-03 v2 run).
+            raise RuntimeError("WeCom websocket closed")
 
     async def _heartbeat_loop(self) -> None:
         """Send lightweight application-level pings."""
@@ -384,6 +553,26 @@ class WeComAdapter(BasePlatformAdapter):
         except asyncio.CancelledError:
             pass
 
+    def _capture_callback_frame(self, raw: Any, payload: Dict[str, Any]) -> bool:
+        """Capture-gate for inbound frames (F6.1 evidence).
+
+        Returns False only for callback frames whose requested capture did not
+        succeed; the caller must drop such frames instead of dispatching them
+        unrecorded. Non-callback frames (heartbeats, handshake, send-path
+        responses) and the default-off mode always return True, so the bot
+        secret and outbound content never reach the capture directory and the
+        unset case keeps zero behavior change. The raw ``msg.data`` is written
+        verbatim — never a re-serialized payload.
+        """
+        if str(payload.get("cmd") or "") not in CALLBACK_COMMANDS:
+            return True
+        if not self._frame_capture.requested:
+            return True
+        if self._frame_capture.capture(raw):
+            return True
+        logger.error("[%s] Callback dropped: capture-requested-but-failed", self.name)
+        return False
+
     async def _dispatch_payload(self, payload: Dict[str, Any]) -> None:
         """Route inbound websocket payloads."""
         req_id = self._payload_req_id(payload)
@@ -399,9 +588,48 @@ class WeComAdapter(BasePlatformAdapter):
             await self._on_message(payload)
             return
         if cmd in {APP_CMD_PING, APP_CMD_EVENT_CALLBACK}:
+            if cmd == APP_CMD_EVENT_CALLBACK:
+                self._observe_event_callback(payload)
             return
 
         logger.debug("[%s] Ignoring websocket payload: %s", self.name, cmd or payload)
+
+    @staticmethod
+    def _classify_event_callback(payload: Dict[str, Any]) -> str:
+        """Whitelist classification on the documented wire path only.
+
+        The official long-connection document fixes the discriminator at
+        ``body.event.eventtype`` with ``body.msgtype == "event"``. Anything
+        deviating from that shape — including lookalike ``type`` /
+        ``event_type`` fields at other levels — is classified ``other``.
+        """
+        body = payload.get("body")
+        if not isinstance(body, dict) or body.get("msgtype") != "event":
+            return "other"
+        event = body.get("event")
+        if not isinstance(event, dict):
+            return "other"
+        if event.get("eventtype") == "disconnected_event":
+            return "disconnected_event"
+        if event.get("eventtype") == "enter_chat":
+            return "enter_chat"
+        return "other"
+
+    def _observe_event_callback(self, payload: Dict[str, Any]) -> None:
+        """Env-gated whitelist audit log for event callbacks (A1-07 evidence).
+
+        Emits exactly one fixed-label line per event when
+        YOUPET_WECOM_EVENT_OBSERVE is enabled; unset means zero logs and zero
+        behavior change. Observation only — no dispatch, no Core bridge, no
+        reply. Never logs payloads, identifiers, URLs, reasons, or values.
+        """
+        if not self._event_observe:
+            return
+        logger.info(
+            "[%s] WeCom event callback observed: event_class=%s",
+            self.name,
+            self._classify_event_callback(payload),
+        )
 
     def _fail_pending_responses(self, exc: Exception) -> None:
         """Fail all outstanding request futures."""
@@ -488,7 +716,11 @@ class WeComAdapter(BasePlatformAdapter):
             return
 
         msg_id = str(body.get("msgid") or self._payload_req_id(payload) or uuid.uuid4().hex)
-        if self._dedup.is_duplicate(msg_id):
+        if self._youpet_bridge:
+            if self._dedup.was_seen(msg_id):
+                logger.debug("[%s] Duplicate message %s ignored", self.name, msg_id)
+                return
+        elif self._dedup.is_duplicate(msg_id):
             logger.debug("[%s] Duplicate message %s ignored", self.name, msg_id)
             return
         self._remember_reply_req_id(msg_id, self._payload_req_id(payload))
@@ -520,6 +752,40 @@ class WeComAdapter(BasePlatformAdapter):
         # Mirrors what the Telegram adapter does (re.sub @botname).
         if is_group and text:
             text = re.sub(r"^@\S+\s*", "", text).strip()
+        has_youpet_media = self._has_youpet_media_reference(body)
+        has_legacy_media = self._has_legacy_media_reference(body)
+        bridge_message_type = MessageType.PHOTO if has_youpet_media and not text else MessageType.TEXT
+        if not text and reply_text and not has_youpet_media:
+            text = reply_text
+
+        source = self.build_source(
+            chat_id=chat_id,
+            chat_type="group" if is_group else "dm",
+            user_id=sender_id or None,
+            user_name=sender_id or None,
+        )
+
+        if self._youpet_bridge and not has_legacy_media and (text or has_youpet_media):
+            bridge_event = MessageEvent(
+                text=text,
+                message_type=bridge_message_type,
+                source=source,
+                raw_message=payload,
+                message_id=msg_id,
+                timestamp=datetime.now(tz=timezone.utc),
+            )
+            try:
+                skip_agent_dispatch = await self._youpet_bridge.handle_wecom_event(
+                    bridge_event,
+                    {"corp_id": self._youpet_bridge.settings.corp_id or ""},
+                )
+            except YouPetBridgeError as exc:
+                logger.warning("[%s] YouPet bridge failed for %s: %s", self.name, msg_id, exc)
+                return
+            if skip_agent_dispatch:
+                self._dedup.mark_seen(msg_id)
+                return
+
         media_urls, media_types = await self._extract_media(body)
         message_type = self._derive_message_type(body, text, media_types)
         has_reply_context = bool(reply_text and (text or media_urls))
@@ -530,13 +796,6 @@ class WeComAdapter(BasePlatformAdapter):
         if not text and not media_urls:
             logger.debug("[%s] Empty WeCom message skipped", self.name)
             return
-
-        source = self.build_source(
-            chat_id=chat_id,
-            chat_type="group" if is_group else "dm",
-            user_id=sender_id or None,
-            user_name=sender_id or None,
-        )
 
         event = MessageEvent(
             text=text,
@@ -557,6 +816,8 @@ class WeComAdapter(BasePlatformAdapter):
             self._enqueue_text_event(event)
         else:
             await self.handle_message(event)
+        if self._youpet_bridge:
+            self._dedup.mark_seen(msg_id)
 
     # ------------------------------------------------------------------
     # Text message aggregation (handles WeCom client-side splits)
@@ -737,6 +998,46 @@ class WeComAdapter(BasePlatformAdapter):
                 media_types.append(content_type)
 
         return media_paths, media_types
+
+    @staticmethod
+    def _has_youpet_media_reference(body: Dict[str, Any]) -> bool:
+        """Return True when the body carries media metadata for the YouPet bridge."""
+        msgtype = str(body.get("msgtype") or "").lower()
+        if msgtype == "mixed":
+            mixed = body.get("mixed") if isinstance(body.get("mixed"), dict) else {}
+            items = mixed.get("msg_item") if isinstance(mixed.get("msg_item"), list) else []
+            return any(
+                isinstance(item, dict)
+                and str(item.get("msgtype") or "").lower() == "image"
+                and isinstance(item.get("image"), dict)
+                for item in items
+            )
+        if isinstance(body.get("image"), dict):
+            return True
+        appmsg = body.get("appmsg") if isinstance(body.get("appmsg"), dict) else {}
+        if isinstance(appmsg.get("image"), dict):
+            return True
+        quote = body.get("quote") if isinstance(body.get("quote"), dict) else {}
+        return str(quote.get("msgtype") or "").lower() == "image" and isinstance(
+            quote.get("image"),
+            dict,
+        )
+
+    @staticmethod
+    def _has_legacy_media_reference(body: Dict[str, Any]) -> bool:
+        """Return True when media should use the existing binary cache path."""
+        msgtype = str(body.get("msgtype") or "").lower()
+        if msgtype == "file" and isinstance(body.get("file"), dict):
+            return True
+        if msgtype == "appmsg" and isinstance(body.get("appmsg"), dict):
+            appmsg = body["appmsg"]
+            if isinstance(appmsg.get("file"), dict):
+                return True
+        quote = body.get("quote") if isinstance(body.get("quote"), dict) else {}
+        return str(quote.get("msgtype") or "").lower() == "file" and isinstance(
+            quote.get("file"),
+            dict,
+        )
 
     async def _cache_media(self, kind: str, media: Dict[str, Any]) -> Optional[Tuple[str, str]]:
         """Cache an inbound image/file/media reference to local storage."""

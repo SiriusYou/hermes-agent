@@ -21,6 +21,41 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# ─── Rollback stages ──────────────────────────────────────────────────────────
+
+
+async def cancel_task_quietly(task: "asyncio.Task") -> None:
+    """Cancel a task and await it, treating CancelledError as success.
+
+    Any other exception (including the task's own failure) propagates so the
+    caller can treat the stage as unconfirmed.
+    """
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+async def run_rollback_stages(owner: str, stages: list) -> list:
+    """Run ``(label, action)`` rollback stages independently.
+
+    One stage's failure never skips later stages. Stage failures are logged
+    with the fixed stage label only (never the exception payload) and
+    collected; the caller reports the returned unconfirmed labels. Resource
+    references should be cleared by the caller when staging, so an
+    unconfirmed stage is always reported rather than silently retried.
+    """
+    unconfirmed: list = []
+    for label, action in stages:
+        try:
+            await action()
+        except Exception:
+            logger.warning("[%s] Rollback stage failed: stage=%s", owner, label)
+            unconfirmed.append(label)
+    return unconfirmed
+
+
 # ─── Message Deduplication ────────────────────────────────────────────────────
 
 
@@ -47,6 +82,13 @@ class MessageDeduplicator:
 
     def is_duplicate(self, msg_id: str) -> bool:
         """Return True if *msg_id* was already seen within the TTL window."""
+        if self.was_seen(msg_id):
+            return True
+        self.mark_seen(msg_id)
+        return False
+
+    def was_seen(self, msg_id: str) -> bool:
+        """Return True if *msg_id* is currently remembered without mutating."""
         if not msg_id:
             return False
         now = time.time()
@@ -55,6 +97,13 @@ class MessageDeduplicator:
                 return True
             # Entry has expired — remove it and treat as new
             del self._seen[msg_id]
+        return False
+
+    def mark_seen(self, msg_id: str) -> None:
+        """Remember *msg_id* as successfully consumed."""
+        if not msg_id:
+            return
+        now = time.time()
         self._seen[msg_id] = now
         if len(self._seen) > self._max_size:
             cutoff = now - self._ttl
@@ -68,7 +117,6 @@ class MessageDeduplicator:
                     key=lambda item: item[1],
                 )[-self._max_size:]
                 self._seen = dict(newest)
-        return False
 
     def clear(self):
         """Clear all tracked messages."""

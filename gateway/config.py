@@ -1632,13 +1632,23 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         if Platform.WECOM not in config.platforms:
             config.platforms[Platform.WECOM] = PlatformConfig()
         config.platforms[Platform.WECOM].enabled = True
-        config.platforms[Platform.WECOM].extra.update({
+        extra = config.platforms[Platform.WECOM].extra
+        extra.update({
             "bot_id": wecom_bot_id,
             "secret": wecom_secret,
         })
+        wecom_dm_policy = os.getenv("WECOM_DM_POLICY", "").strip().lower()
+        if wecom_dm_policy:
+            extra["dm_policy"] = wecom_dm_policy
+        wecom_group_policy = os.getenv("WECOM_GROUP_POLICY", "").strip().lower()
+        if wecom_group_policy:
+            extra["group_policy"] = wecom_group_policy
+        wecom_allowed_users = os.getenv("WECOM_ALLOWED_USERS", "").strip()
+        if wecom_allowed_users:
+            extra["allow_from"] = wecom_allowed_users
         wecom_ws_url = os.getenv("WECOM_WEBSOCKET_URL", "")
         if wecom_ws_url:
-            config.platforms[Platform.WECOM].extra["websocket_url"] = wecom_ws_url
+            extra["websocket_url"] = wecom_ws_url
         wecom_home = os.getenv("WECOM_HOME_CHANNEL")
         if wecom_home:
             config.platforms[Platform.WECOM].home_channel = HomeChannel(
