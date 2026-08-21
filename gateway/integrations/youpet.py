@@ -700,7 +700,7 @@ class YouPetBridge:
             raise YouPetBridgeError("WeCom send failed: send_exception") from exc
         if isinstance(result, SendResult) and not result.success:
             self._log_outbox_send_attempt(ctx, outcome="failed", error_label="send_rejected")
-            raise YouPetBridgeError(result.error or "WeCom send failed")
+            raise YouPetBridgeError("WeCom send failed: send_rejected")
         self._log_outbox_send_attempt(ctx, outcome="sent")
 
     async def _ack(self, event_id: str) -> None:

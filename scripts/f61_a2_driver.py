@@ -69,6 +69,13 @@ CLEANUP_TIMEOUT_SECONDS = 5.0  # bound all close/disconnect handshakes
 HERE = Path(__file__).resolve()
 REPO_ROOT = HERE.parents[1]
 DRIVER_REL = "scripts/f61_a2_driver.py"
+LOAD_BEARING_MODULES = (
+    DRIVER_REL,
+    "gateway/platforms/wecom.py",
+    "gateway/config.py",
+    "gateway/platforms/helpers.py",
+    "gateway/platforms/wecom_frame_capture.py",
+)
 OFFICIAL_DOC_URL = "https://developer.work.weixin.qq.com/document/path/101463"
 OFFICIAL_DOC_CHECKED_AT = "2026-08-15"
 
@@ -144,7 +151,8 @@ def verify_committed_self(root: Path = REPO_ROOT) -> str:
     Porcelain alone is not an exact-byte gate: skip-worktree/assume-unchanged
     index flags hide modified files from it. So: reject any index flags,
     require empty porcelain, and blob-compare the load-bearing modules
-    (driver, adapter, config/policy loader) against frozen HEAD blobs.
+    (driver, adapter, config/policy loader, and imported helper modules)
+    against frozen HEAD blobs.
     Returns "" or an error string.
     """
     try:
@@ -169,7 +177,7 @@ def verify_committed_self(root: Path = REPO_ROOT) -> str:
         ).stdout.strip()
         if dirty:
             return f"tracked worktree differs from HEAD {head[:12]}"
-        for rel in (DRIVER_REL, "gateway/platforms/wecom.py", "gateway/config.py"):
+        for rel in LOAD_BEARING_MODULES:
             expected = subprocess.run(
                 ["git", "-C", str(root), "rev-parse", f"{head}:{rel}"],
                 capture_output=True, text=True, check=True,
