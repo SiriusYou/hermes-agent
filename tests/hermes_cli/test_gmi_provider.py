@@ -119,7 +119,15 @@ class TestGmiModelCatalog:
         )
         monkeypatch.setattr("hermes_cli.models.fetch_api_models", lambda api_key, base_url: None)
 
-        assert provider_model_ids("gmi") == list(_PROVIDER_MODELS["gmi"])
+        with (
+            patch("providers.base.ProviderProfile.fetch_models", return_value=None),
+            patch(
+                "urllib.request.urlopen",
+                side_effect=AssertionError("unexpected model discovery HTTP request"),
+            ) as network_spy,
+        ):
+            assert provider_model_ids("gmi") == list(_PROVIDER_MODELS["gmi"])
+        network_spy.assert_not_called()
 
 
 class TestGmiProvidersModule:
