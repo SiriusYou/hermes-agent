@@ -476,6 +476,43 @@ class TestSendExceptionPath:
         assert nack_call["url"].endswith(f"/outbox/{delivery_id}/nack")
         assert canary not in nack_call["json"]["error"]
 
+    @pytest.mark.asyncio
+    async def test_send_rejection_logs_one_safe_record_and_still_nacks(self, caplog):
+        canary = "CANARY-SECRET-5h2m"
+
+        async def canary_send(chat_id, content):
+            return SendResult(success=False, error=canary)
+
+        bridge = YouPetBridge(
+            _settings(user_chat_map={"user-1": "chat-1"}),
+            canary_send,
+        )
+        delivery_id = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+        client = FakeCoreClient(
+            outbox_items=[_escalated_item(delivery_id, "biz-reject", 0)]
+        )
+        bridge._client = client
+
+        with caplog.at_level(logging.INFO, logger="gateway.integrations.youpet"):
+            counts = await bridge.poll_once()
+
+        assert counts["nacked"] == 1
+        attempts = [
+            record
+            for record in caplog.records
+            if "outbox_send_attempt" in record.getMessage()
+        ]
+        assert len(attempts) == 1
+        fields = _attempt_fields(attempts[0])
+        assert fields["outcome"] == "failed"
+        assert fields["error_label"] == "send_rejected"
+        for record in caplog.records:
+            assert canary not in record.getMessage()
+        nack_call = client.post_calls[-1]
+        assert nack_call["url"].endswith(f"/outbox/{delivery_id}/nack")
+        assert nack_call["json"]["error"] == "WeCom send failed: send_rejected"
+        assert canary not in nack_call["json"]["error"]
+
 
 class TestAttemptStateBounds:
     @pytest.mark.asyncio

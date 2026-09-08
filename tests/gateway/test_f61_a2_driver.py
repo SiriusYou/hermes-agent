@@ -593,6 +593,8 @@ class TestCommittedSelfCheck:
             (tmp_path / "scripts" / "f61_a2_driver.py").write_text("# driver\n")
         (tmp_path / "gateway" / "platforms").mkdir(parents=True)
         (tmp_path / "gateway" / "platforms" / "wecom.py").write_text("# adapter\n")
+        (tmp_path / "gateway" / "platforms" / "helpers.py").write_text("# helper module\n")
+        (tmp_path / "gateway" / "platforms" / "wecom_frame_capture.py").write_text("# frame capture module\n")
         (tmp_path / "gateway" / "config.py").write_text("# policy loader stand-in\n")
         self._git(tmp_path, "add", ".")
         self._git(tmp_path, "commit", "-qm", "init")
@@ -610,6 +612,16 @@ class TestCommittedSelfCheck:
     def test_policy_module_mismatch_fails(self, tmp_path):
         self._make_repo(tmp_path)
         (tmp_path / "gateway" / "config.py").write_text("# tampered allowlist\n")
+        assert driver.verify_committed_self(tmp_path) != ""
+
+    def test_helper_module_mismatch_fails(self, tmp_path):
+        self._make_repo(tmp_path)
+        (tmp_path / "gateway" / "platforms" / "helpers.py").write_text("# tampered helper\n")
+        assert driver.verify_committed_self(tmp_path) != ""
+
+    def test_frame_capture_module_mismatch_fails(self, tmp_path):
+        self._make_repo(tmp_path)
+        (tmp_path / "gateway" / "platforms" / "wecom_frame_capture.py").write_text("# tampered frame capture\n")
         assert driver.verify_committed_self(tmp_path) != ""
 
     def test_driver_not_committed_fails(self, tmp_path):

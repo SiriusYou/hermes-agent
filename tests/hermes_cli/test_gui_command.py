@@ -48,6 +48,10 @@ def _make_packaged_executable(root: Path, monkeypatch, platform: str = "darwin")
     return exe
 
 
+def _npm_only(command: str) -> str | None:
+    return "/usr/bin/npm" if command == "npm" else None
+
+
 def test_gui_installs_packages_and_launches_desktop_app(tmp_path, monkeypatch):
     root = _make_desktop_tree(tmp_path)
     desktop_dir = root / "apps" / "desktop"
@@ -58,7 +62,7 @@ def test_gui_installs_packages_and_launches_desktop_app(tmp_path, monkeypatch):
     pack_ok = subprocess.CompletedProcess(["npm", "run", "pack"], 0)
     launch_ok = subprocess.CompletedProcess([str(packaged_exe)], 0)
 
-    with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/npm"), \
+    with patch("hermes_cli.main.shutil.which", side_effect=_npm_only), \
          patch("hermes_cli.main._run_npm_install_deterministic", return_value=install_ok) as mock_install, \
          patch("hermes_cli.main.subprocess.run", side_effect=[pack_ok, launch_ok]) as mock_run, \
          pytest.raises(SystemExit) as exc:
@@ -83,7 +87,7 @@ def test_gui_forwards_desktop_environment_overrides(tmp_path, monkeypatch):
 
     ok = subprocess.CompletedProcess([], 0)
 
-    with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/npm"), \
+    with patch("hermes_cli.main.shutil.which", side_effect=_npm_only), \
          patch("hermes_cli.main._run_npm_install_deterministic", return_value=ok), \
          patch("hermes_cli.main.subprocess.run", side_effect=[ok, ok]) as mock_run, \
          pytest.raises(SystemExit):
